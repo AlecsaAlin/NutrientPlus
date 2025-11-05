@@ -14,7 +14,8 @@ class FoodDataPreprocessor:
             reviews_path: str,
             history_path: str,
             recipes_path: str,
-            max_history_len: int = 20
+            max_history_len: int = 30,
+            sample_size: int = 1000  # NEW: Allow sampling for faster testing
     ):
         """
         Args:
@@ -22,14 +23,24 @@ class FoodDataPreprocessor:
             history_path: Path to history CSV (user_id, history)
             recipes_path: Path to recipes CSV (RecipeId, Name, AuthorId, CookTime, etc.)
             max_history_len: Maximum length of user history sequence
+            sample_size: If set, randomly sample this many reviews for faster testing
         """
         self.max_history_len = max_history_len
+        self.sample_size = sample_size
 
         print("Loading datasets...")
-        self.reviews_df = pd.read_csv(reviews_path)
+
+        # Load reviews (optionally sample for testing)
+        if sample_size:
+            print(f"  Sampling {sample_size} reviews for testing...")
+            # For sampling, just use pandas nrows parameter (simpler and faster)
+            self.reviews_df = pd.read_csv(reviews_path, nrows=sample_size, encoding='utf-8', encoding_errors='ignore')
+        else:
+            self.reviews_df = pd.read_csv(reviews_path, encoding='utf-8', encoding_errors='ignore')
+
         # Use low_memory=False to avoid dtype warnings on large files
-        self.history_df = pd.read_csv(history_path, low_memory=False)
-        self.recipes_df = pd.read_csv(recipes_path)
+        self.history_df = pd.read_csv(history_path, low_memory=False, encoding='utf-8', encoding_errors='ignore')
+        self.recipes_df = pd.read_csv(recipes_path, encoding='utf-8', encoding_errors='ignore')
 
         print(f"Loaded {len(self.reviews_df)} reviews")
         print(f"Loaded {len(self.history_df)} user histories")
@@ -82,7 +93,7 @@ class FoodDataPreprocessor:
 
         # Identify available nutritional columns
         self.available_nutrition_cols = []
-        possible_cols = ['Calories','ProteinContent']
+        possible_cols = ['Calories', 'ProteinContent']
 
         for col in possible_cols:
             if col in self.recipes_df.columns:
@@ -128,16 +139,16 @@ class FoodDataPreprocessor:
 
     def _create_mappings(self):
         """Create ID mappings for users and foods."""
-        # Get all unique users and foods
+        print("Creating ID mappings...")
+
+        # Get all unique users and foods efficiently
         all_users = set(self.reviews_df['UserId'].unique())
         all_users.update(self.history_df['UserId'].unique())
 
         all_foods = set(self.reviews_df['FoodId'].unique())
         all_foods.update(self.recipes_df['FoodId'].unique())
 
-        # Add foods from history
-        for hist in self.history_df['parsed_history']:
-            all_foods.update(hist)
+        print(f"Found {len(all_users)} unique users and {len(all_foods)} unique foods")
 
         # Create mappings (start from 1, reserve 0 for padding)
         self.user_id_map = {uid: idx + 1 for idx, uid in enumerate(sorted(all_users))}
@@ -149,14 +160,29 @@ class FoodDataPreprocessor:
 
         print(f"Created mappings for {len(self.user_id_map)} users and {len(self.food_id_map)} foods")
 
-        # Create user history dictionary
+        # Create user history dictionary efficiently using vectorized operations
+        print("Creating user history dictionary...")
         self.user_history_dict = {}
-        for _, row in self.history_df.iterrows():
-            user_id = row['UserId']
-            history = row['parsed_history'][:self.max_history_len]  # Take most recent
-            # Map food IDs
-            mapped_history = [self.food_id_map.get(fid, 0) for fid in history if fid in self.food_id_map]
-            self.user_history_dict[user_id] = mapped_history
+
+        # Process in chunks to avoid memory issues
+        chunk_size = 10000
+        total_rows = len(self.history_df)
+
+        for start_idx in range(0, total_rows, chunk_size):
+            end_idx = min(start_idx + chunk_size, total_rows)
+            chunk = self.history_df.iloc[start_idx:end_idx]
+
+            for idx in range(len(chunk)):
+                user_id = chunk.iloc[idx]['UserId']
+                history = chunk.iloc[idx]['parsed_history'][:self.max_history_len]
+                # Map food IDs
+                mapped_history = [self.food_id_map.get(fid, 0) for fid in history if fid in self.food_id_map]
+                self.user_history_dict[user_id] = mapped_history
+
+            if (end_idx % 50000) == 0 or end_idx == total_rows:
+                print(f"  Processed {end_idx}/{total_rows} user histories...")
+
+        print(f"✓ User history dictionary created for {len(self.user_history_dict)} users")
 
     def _prepare_training_data(self):
         """Prepare the training dataframe by merging reviews with recipe features."""
@@ -287,6 +313,7 @@ class FoodRecommendationDataset(Dataset):
                     item_features_list.append(float(row[col]) / 2000.0)
                 elif col == 'ProteinContent':
                     item_features_list.append(float(row[col]) / 50.0)
+                else:
                     # Generic normalization for other nutrients
                     item_features_list.append(float(row[col]) / 100.0)
             else:
@@ -317,39 +344,61 @@ class FoodRecommendationDataset(Dataset):
         return (user_id_tensor, user_features, user_history,
                 item_id_tensor, item_features, position, labels)
 
-
 # Example usage
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--reviews', default='reviews.csv')
+    parser.add_argument('--history', default='user_history.csv')
+    parser.add_argument('--recipes', default='recipes.csv')
+    parser.add_argument('--sample', type=int, default=1000,
+                        help='Sample N reviews for quick testing')
+    args = parser.parse_args()
+
     # Initialize preprocessor
+    print("\n" + "=" * 70)
+    print("FOOD RECOMMENDATION DATA LOADER")
+    print("=" * 70)
+
     preprocessor = FoodDataPreprocessor(
-        reviews_path="reviews.csv",
-        history_path="user_history.csv",
-        recipes_path="recipes.csv",
-        max_history_len=20
+        reviews_path=args.reviews,
+        history_path=args.history,
+        recipes_path=args.recipes,
+        max_history_len=20,
+        sample_size=args.sample  # Use sample for testing
     )
 
     # Get dataset info
     info = preprocessor.get_dataset_info()
-    print("\nDataset Info:")
-    print(f"  Number of users: {info['num_users']}")
-    print(f"  Number of foods: {info['num_foods']}")
+    print("\n" + "=" * 70)
+    print("DATASET INFO")
+    print("=" * 70)
+    print(f"  Number of users: {info['num_users']:,}")
+    print(f"  Number of foods: {info['num_foods']:,}")
     print(f"  User feature dim: {info['user_feature_dim']}")
     print(f"  Food feature dim: {info['food_feature_dim']}")
     print(f"  Max history length: {info['max_history_len']}")
 
     # Create PyTorch dataset
+    print("\n" + "=" * 70)
+    print("CREATING PYTORCH DATASET")
+    print("=" * 70)
     dataset = FoodRecommendationDataset(preprocessor)
+    print(f"✓ Dataset created with {len(dataset):,} samples")
 
     # Create dataloader
     dataloader = DataLoader(
         dataset,
-        batch_size=256,
+        batch_size=128,
         shuffle=True,
         num_workers=0  # Set to 0 for Windows, >0 for Linux/Mac
     )
 
     # Test loading a batch
-    print("\nTesting batch loading...")
+    print("\n" + "=" * 70)
+    print("TESTING BATCH LOADING")
+    print("=" * 70)
     for batch in dataloader:
         user_ids, user_features, user_history, item_ids, item_features, positions, labels = batch
         print(f"  User IDs shape: {user_ids.shape}")
@@ -359,6 +408,9 @@ if __name__ == "__main__":
         print(f"  Item features shape: {item_features.shape}")
         print(f"  Positions shape: {positions.shape}")
         print(f"  Labels shape: {labels.shape}")
+        print("\n✓ Batch loaded successfully!")
         break
 
-    print("\nDataset ready for training!")
+    print("=" * 70)
+    print("✓ DATASET READY FOR TRAINING!")
+    print("=" * 70)

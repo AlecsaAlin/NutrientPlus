@@ -4,6 +4,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import Dict, List, Tuple
 from collections import defaultdict
+import pickle
+import os
 
 
 class FoodDataPreprocessor:
@@ -14,8 +16,8 @@ class FoodDataPreprocessor:
             reviews_path: str,
             history_path: str,
             recipes_path: str,
-            max_history_len: int = 30,
-            sample_size: int = 1000  # NEW: Allow sampling for faster testing
+            max_history_len: int = 20,
+            sample_size: int = None
     ):
         """
         Args:
@@ -33,7 +35,6 @@ class FoodDataPreprocessor:
         # Load reviews (optionally sample for testing)
         if sample_size:
             print(f"  Sampling {sample_size} reviews for testing...")
-            # For sampling, just use pandas nrows parameter (simpler and faster)
             self.reviews_df = pd.read_csv(reviews_path, nrows=sample_size, encoding='utf-8', encoding_errors='ignore')
         else:
             self.reviews_df = pd.read_csv(reviews_path, encoding='utf-8', encoding_errors='ignore')
@@ -52,6 +53,8 @@ class FoodDataPreprocessor:
 
     def _preprocess_data(self):
         """Clean and preprocess the raw data."""
+        print("\nPreprocessing data...")
+
         # Clean reviews
         self.reviews_df['Rating'] = pd.to_numeric(self.reviews_df['Rating'], errors='coerce')
         self.reviews_df = self.reviews_df.dropna(subset=['Rating', 'RecipeId'])
@@ -100,11 +103,31 @@ class FoodDataPreprocessor:
                 self.available_nutrition_cols.append(col)
                 # Convert to numeric
                 self.recipes_df[col] = pd.to_numeric(self.recipes_df[col], errors='coerce')
-                # Fill missing values using .loc to avoid warning
+
+                # ✅ BETTER DEFAULT VALUES
+                if col == 'Calories':
+                    default_val = 200  # Reasonable default for a recipe
+                elif col == 'ProteinContent':
+                    default_val = 10  # Reasonable default
+                else:
+                    default_val = 0
+
                 median_val = self.recipes_df[col].median()
-                if pd.isna(median_val):
-                    median_val = 0
-                self.recipes_df.loc[:, col] = self.recipes_df[col].fillna(median_val)
+                fill_val = median_val if not pd.isna(median_val) else default_val
+
+                self.recipes_df.loc[:, col] = self.recipes_df[col].fillna(fill_val)
+
+                # ✅ REMOVE EXTREME OUTLIERS
+                if col == 'Calories':
+                    # Cap at 10,000 calories (extremely high but possible for party recipes)
+                    self.recipes_df.loc[self.recipes_df[col] > 10000, col] = 10000
+                    # Set negative values to default
+                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
+                elif col == 'ProteinContent':
+                    # Cap at 500g protein
+                    self.recipes_df.loc[self.recipes_df[col] > 500, col] = 500
+                    # Set negative values to default
+                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
 
         print(f"Available nutritional columns: {self.available_nutrition_cols}")
 
@@ -136,6 +159,8 @@ class FoodDataPreprocessor:
             self.recipes_df['PrepTimeMinutes'] = self.recipes_df['PrepTime'].apply(parse_time)
         if 'TotalTime' in self.recipes_df.columns:
             self.recipes_df['TotalTimeMinutes'] = self.recipes_df['TotalTime'].apply(parse_time)
+            # ✅ CAP EXTREME TIME VALUES
+            self.recipes_df.loc[self.recipes_df['TotalTimeMinutes'] > 1440, 'TotalTimeMinutes'] = 1440  # Max 24 hours
 
     def _create_mappings(self):
         """Create ID mappings for users and foods."""
@@ -160,27 +185,16 @@ class FoodDataPreprocessor:
 
         print(f"Created mappings for {len(self.user_id_map)} users and {len(self.food_id_map)} foods")
 
-        # Create user history dictionary efficiently using vectorized operations
+        # Create user history dictionary efficiently
         print("Creating user history dictionary...")
         self.user_history_dict = {}
 
-        # Process in chunks to avoid memory issues
-        chunk_size = 10000
-        total_rows = len(self.history_df)
-
-        for start_idx in range(0, total_rows, chunk_size):
-            end_idx = min(start_idx + chunk_size, total_rows)
-            chunk = self.history_df.iloc[start_idx:end_idx]
-
-            for idx in range(len(chunk)):
-                user_id = chunk.iloc[idx]['UserId']
-                history = chunk.iloc[idx]['parsed_history'][:self.max_history_len]
-                # Map food IDs
-                mapped_history = [self.food_id_map.get(fid, 0) for fid in history if fid in self.food_id_map]
-                self.user_history_dict[user_id] = mapped_history
-
-            if (end_idx % 50000) == 0 or end_idx == total_rows:
-                print(f"  Processed {end_idx}/{total_rows} user histories...")
+        for idx in range(len(self.history_df)):
+            user_id = self.history_df.iloc[idx]['UserId']
+            history = self.history_df.iloc[idx]['parsed_history'][:self.max_history_len]
+            # Map food IDs
+            mapped_history = [self.food_id_map.get(fid, 0) for fid in history if fid in self.food_id_map]
+            self.user_history_dict[user_id] = mapped_history
 
         print(f"✓ User history dictionary created for {len(self.user_history_dict)} users")
 
@@ -193,15 +207,23 @@ class FoodDataPreprocessor:
             how='left'
         )
 
-        # Add position (simulate position in recommendation list)
-        # In real scenario, you'd have actual position data
-        self.training_df['Position'] = np.random.randint(0, 10, size=len(self.training_df))
+        print("Generating Position based on Rating...")
+
+        # Sort by rating in descending order (best ratings first)
+        self.training_df = self.training_df.sort_values('Rating', ascending=False).reset_index(drop=True)
+
+        # Assign position within each user's history
+        self.training_df['Position'] = self.training_df.groupby('UserId').cumcount()
+
+        # Cap positions at 9 (top 10 items)
+        self.training_df['Position'] = self.training_df['Position'].clip(upper=9)
 
         # Create binary engagement signals
         self.training_df['HighRating'] = (self.training_df['Rating'] >= 4).astype(float)
         self.training_df['HasReview'] = (~self.training_df['Review'].isna()).astype(float)
 
         print(f"Prepared {len(self.training_df)} training samples")
+        print(f"Position distribution:\n{self.training_df['Position'].value_counts().sort_index()}")
 
     def get_dataset_info(self) -> Dict:
         """Returns information needed to initialize the model."""
@@ -213,9 +235,87 @@ class FoodDataPreprocessor:
             'max_history_len': self.max_history_len,
         }
 
+    def save_preprocessed(self, output_dir: str):
+        """
+        Save preprocessed data for fast loading later.
+
+        Args:
+            output_dir: Directory to save preprocessed files
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        print(f"\nSaving preprocessed data to {output_dir}...")
+
+        # Save dataframes
+        self.training_df.to_pickle(os.path.join(output_dir, 'training_df.pkl'))
+        self.history_df.to_pickle(os.path.join(output_dir, 'history_df.pkl'))
+        self.recipes_df.to_pickle(os.path.join(output_dir, 'recipes_df.pkl'))
+
+        # Save mappings and metadata
+        metadata = {
+            'user_id_map': self.user_id_map,
+            'food_id_map': self.food_id_map,
+            'reverse_user_map': self.reverse_user_map,
+            'reverse_food_map': self.reverse_food_map,
+            'user_history_dict': self.user_history_dict,
+            'available_nutrition_cols': self.available_nutrition_cols,
+            'max_history_len': self.max_history_len,
+        }
+
+        with open(os.path.join(output_dir, 'metadata.pkl'), 'wb') as f:
+            pickle.dump(metadata, f)
+
+        print(f"✓ Saved training_df.pkl ({len(self.training_df):,} samples)")
+        print(f"✓ Saved history_df.pkl ({len(self.history_df):,} users)")
+        print(f"✓ Saved recipes_df.pkl ({len(self.recipes_df):,} recipes)")
+        print(f"✓ Saved metadata.pkl")
+        print(f"\n✓ Preprocessing complete! Saved to {output_dir}")
+
+    @classmethod
+    def load_preprocessed(cls, input_dir: str):
+        """
+        Load preprocessed data quickly without reprocessing.
+
+        Args:
+            input_dir: Directory containing preprocessed files
+
+        Returns:
+            FoodDataPreprocessor instance with loaded data
+        """
+        print(f"Loading preprocessed data from {input_dir}...")
+
+        # Create empty instance
+        instance = cls.__new__(cls)
+
+        # Load dataframes
+        instance.training_df = pd.read_pickle(os.path.join(input_dir, 'training_df.pkl'))
+        instance.history_df = pd.read_pickle(os.path.join(input_dir, 'history_df.pkl'))
+        instance.recipes_df = pd.read_pickle(os.path.join(input_dir, 'recipes_df.pkl'))
+
+        # Load metadata
+        with open(os.path.join(input_dir, 'metadata.pkl'), 'rb') as f:
+            metadata = pickle.load(f)
+
+        instance.user_id_map = metadata['user_id_map']
+        instance.food_id_map = metadata['food_id_map']
+        instance.reverse_user_map = metadata['reverse_user_map']
+        instance.reverse_food_map = metadata['reverse_food_map']
+        instance.user_history_dict = metadata['user_history_dict']
+        instance.available_nutrition_cols = metadata['available_nutrition_cols']
+        instance.max_history_len = metadata['max_history_len']
+
+        # Also need reviews_df for dataset creation
+        instance.reviews_df = instance.training_df[['UserId', 'FoodId', 'Rating', 'Review']].copy()
+
+        print(f"✓ Loaded {len(instance.training_df):,} training samples")
+        print(f"✓ Loaded {len(instance.user_history_dict):,} user histories")
+        print(f"✓ Loaded {len(instance.recipes_df):,} recipes")
+
+        return instance
+
     def _get_user_feature_dim(self) -> int:
         """Calculate user feature dimension (basic demographic features)."""
-        return 5  # avg_rating, num_reviews, avg_cook_time_preference, etc.
+        return 5  # avg_rating, num_reviews, avg_cook_time_preference, placeholder, placeholder
 
     def _get_food_feature_dim(self) -> int:
         """Calculate food feature dimension based on available recipe columns."""
@@ -257,6 +357,8 @@ class FoodRecommendationDataset(Dataset):
             time_stats = self.df.groupby('UserId')['TotalTimeMinutes'].mean().reset_index()
             time_stats.columns = ['UserId', 'AvgTimePreference']
             user_stats = user_stats.merge(time_stats, on='UserId', how='left')
+            # Fill NaN time preferences with default
+            user_stats['AvgTimePreference'] = user_stats['AvgTimePreference'].fillna(30.0)
         else:
             user_stats['AvgTimePreference'] = 30.0
 
@@ -269,19 +371,24 @@ class FoodRecommendationDataset(Dataset):
         row = self.df.iloc[idx]
 
         # 1. User ID
-        user_id = self.user_id_map[row['UserId']]
+        user_id = self.user_id_map.get(row['UserId'], 1)
         user_id_tensor = torch.tensor(user_id, dtype=torch.long)
 
-        # 2. User Features
+        # 2. User Features (with safe normalization!)
         user_stats = self.user_features_df[
             self.user_features_df['UserId'] == row['UserId']
             ]
 
         if len(user_stats) > 0:
+            avg_rating = user_stats['AvgRating'].values[0]
+            num_reviews = user_stats['NumReviews'].values[0]
+            avg_time = user_stats['AvgTimePreference'].values[0]
+
+            # ✅ SAFE NORMALIZATION WITH CLIPPING
             user_features = torch.tensor([
-                user_stats['AvgRating'].values[0] / 5.0,  # normalize to 0-1
-                min(user_stats['NumReviews'].values[0] / 100.0, 1.0),  # cap at 100
-                user_stats['AvgTimePreference'].values[0] / 180.0,  # normalize by 3 hours
+                np.clip(avg_rating / 5.0, 0, 1),  # Clip to [0, 1]
+                np.clip(num_reviews / 100.0, 0, 1),  # Clip to [0, 1]
+                np.clip(avg_time / 180.0, 0, 3),  # Allow up to 540 min, then clip
                 0.0,  # placeholder for dietary preference
                 0.0,  # placeholder for another feature
             ], dtype=torch.float32)
@@ -302,26 +409,31 @@ class FoodRecommendationDataset(Dataset):
         item_id = self.food_id_map.get(row['FoodId'], 0)
         item_id_tensor = torch.tensor(item_id, dtype=torch.long)
 
-        # 5. Food Features - dynamically build based on available columns
+        # 5. Food Features - dynamically build based on available columns (with safe normalization!)
         item_features_list = []
 
         # Add nutritional features that are available
         for col in self.available_nutrition_cols:
             if col in row.index and not pd.isna(row[col]):
-                # Normalize based on typical daily values
+                val = float(row[col])
+                # ✅ SAFE NORMALIZATION WITH CLIPPING
                 if col == 'Calories':
-                    item_features_list.append(float(row[col]) / 2000.0)
+                    # Normalize by 2000 calories, allow up to 6000
+                    item_features_list.append(np.clip(val / 2000.0, 0, 3))
                 elif col == 'ProteinContent':
-                    item_features_list.append(float(row[col]) / 50.0)
+                    # Normalize by 50g, allow up to 250g
+                    item_features_list.append(np.clip(val / 50.0, 0, 5))
                 else:
                     # Generic normalization for other nutrients
-                    item_features_list.append(float(row[col]) / 100.0)
+                    item_features_list.append(np.clip(val / 100.0, 0, 10))
             else:
                 item_features_list.append(0.0)
 
         # Add time feature if available
         if 'TotalTimeMinutes' in row.index and not pd.isna(row['TotalTimeMinutes']):
-            item_features_list.append(float(row['TotalTimeMinutes']) / 180.0)
+            time_val = float(row['TotalTimeMinutes'])
+            # Normalize by 180 min (3 hours), allow up to 900 min (15 hours)
+            item_features_list.append(np.clip(time_val / 180.0, 0, 5))
         elif 'TotalTimeMinutes' in self.df.columns:
             item_features_list.append(0.0)
 
@@ -331,43 +443,88 @@ class FoodRecommendationDataset(Dataset):
 
         item_features = torch.tensor(item_features_list, dtype=torch.float32)
 
-        # 6. Position
+        # ✅ SAFETY CHECK FOR NaN/Inf BEFORE RETURNING
+        if torch.isnan(item_features).any() or torch.isinf(item_features).any():
+            print(f"⚠️ Warning: NaN/Inf in item_features at idx {idx}, replacing with zeros")
+            item_features = torch.nan_to_num(item_features, nan=0.0, posinf=1.0, neginf=0.0)
+
+        if torch.isnan(user_features).any() or torch.isinf(user_features).any():
+            print(f"⚠️ Warning: NaN/Inf in user_features at idx {idx}, replacing with defaults")
+            user_features = torch.nan_to_num(user_features, nan=0.0, posinf=1.0, neginf=0.0)
+
+        # 6. Position (from rating-based ranking)
         position = torch.tensor(row.get('Position', 0), dtype=torch.long)
 
         # 7. Labels (multi-task: [high_rating, normalized_rating, has_review])
+        rating = row['Rating']
+        if pd.isna(rating):
+            rating = 2.5  # Default to middle rating if missing
+
         labels = torch.tensor([
-            float(row['HighRating']),  # binary: rating >= 4
-            row['Rating'] / 5.0,  # normalized rating
-            float(row['HasReview']),  # binary: wrote review
+            float(rating >= 4.0),  # binary: rating >= 4
+            np.clip(rating / 5.0, 0, 1),  # ✅ normalized rating with clip
+            float(row['HasReview']) if not pd.isna(row['HasReview']) else 0.0,  # binary: wrote review
         ], dtype=torch.float32)
 
         return (user_id_tensor, user_features, user_history,
                 item_id_tensor, item_features, position, labels)
 
+
 # Example usage
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--reviews', default='reviews.csv')
-    parser.add_argument('--history', default='user_history.csv')
-    parser.add_argument('--recipes', default='recipes.csv')
-    parser.add_argument('--sample', type=int, default=1000,
+    parser = argparse.ArgumentParser(description="Food Recommendation Data Preprocessor")
+    parser.add_argument('--reviews', type=str, default='reviews.csv',
+                        help='Path to reviews CSV file')
+    parser.add_argument('--history', type=str, default='user_history.csv',
+                        help='Path to user history CSV file')
+    parser.add_argument('--recipes', type=str, default='recipes.csv',
+                        help='Path to recipes CSV file')
+    parser.add_argument('--sample', type=int, default=None,
                         help='Sample N reviews for quick testing')
-    args = parser.parse_args()
+    parser.add_argument('--save', type=str, default=None,
+                        help='Save preprocessed data to this directory')
+    parser.add_argument('--load', type=str, default=None,
+                        help='Load preprocessed data from this directory')
+
+    # Quick test mode - uncomment and modify paths for your setup
+    QUICK_TEST = False  # Set to True to enable quick test
+
+    if QUICK_TEST:
+        print("🔥 QUICK TEST MODE ENABLED 🔥\n")
+        args = type('Args', (), {
+            'reviews': 'Datasets/reviews.csv',
+            'history': 'Datasets/user_history.csv',
+            'recipes': 'Datasets/recipes.csv',
+            'sample': 10000,  # Use 10K sample for quick testing
+            'save': 'preprocessed_data_10k',
+            'load': None
+        })()
+    else:
+        args = parser.parse_args()
 
     # Initialize preprocessor
     print("\n" + "=" * 70)
-    print("FOOD RECOMMENDATION DATA LOADER")
+    print("FOOD RECOMMENDATION DATA LOADER - WITH NaN/INF FIXES")
     print("=" * 70)
 
-    preprocessor = FoodDataPreprocessor(
-        reviews_path=args.reviews,
-        history_path=args.history,
-        recipes_path=args.recipes,
-        max_history_len=20,
-        sample_size=args.sample  # Use sample for testing
-    )
+    if args.load:
+        # Load preprocessed data (much faster!)
+        preprocessor = FoodDataPreprocessor.load_preprocessed(args.load)
+    else:
+        # Process from CSV files
+        preprocessor = FoodDataPreprocessor(
+            reviews_path=args.reviews,
+            history_path=args.history,
+            recipes_path=args.recipes,
+            max_history_len=20,
+            sample_size=args.sample
+        )
+
+        # Save if requested
+        if args.save:
+            preprocessor.save_preprocessed(args.save)
 
     # Get dataset info
     info = preprocessor.get_dataset_info()
@@ -387,18 +544,49 @@ if __name__ == "__main__":
     dataset = FoodRecommendationDataset(preprocessor)
     print(f"✓ Dataset created with {len(dataset):,} samples")
 
+    # ✅ VALIDATE DATA FOR NaN/Inf
+    print("\n" + "=" * 70)
+    print("VALIDATING DATA FOR NaN/Inf")
+    print("=" * 70)
+
+    nan_count = 0
+    inf_count = 0
+    check_samples = len(dataset)
+
+    for i in range(check_samples):
+        sample = dataset[i]
+        user_ids, user_features, user_history, item_ids, item_features, positions, labels = sample
+
+        if torch.isnan(user_features).any():
+            nan_count += 1
+        if torch.isnan(item_features).any():
+            nan_count += 1
+        if torch.isnan(labels).any():
+            nan_count += 1
+
+        if torch.isinf(user_features).any():
+            inf_count += 1
+        if torch.isinf(item_features).any():
+            inf_count += 1
+
+    if nan_count == 0 and inf_count == 0:
+        print(f"✅ No NaN/Inf found in first {check_samples} samples!")
+    else:
+        print(f"⚠️ Found {nan_count} NaN and {inf_count} Inf issues in first {check_samples} samples")
+
     # Create dataloader
+    print("\n" + "=" * 70)
+    print("TESTING BATCH LOADING")
+    print("=" * 70)
+
     dataloader = DataLoader(
         dataset,
-        batch_size=128,
+        batch_size=256,
         shuffle=True,
         num_workers=0  # Set to 0 for Windows, >0 for Linux/Mac
     )
 
     # Test loading a batch
-    print("\n" + "=" * 70)
-    print("TESTING BATCH LOADING")
-    print("=" * 70)
     for batch in dataloader:
         user_ids, user_features, user_history, item_ids, item_features, positions, labels = batch
         print(f"  User IDs shape: {user_ids.shape}")

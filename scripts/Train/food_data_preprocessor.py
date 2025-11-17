@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 from collections import defaultdict
 import pickle
 import os
+from sklearn.model_selection import train_test_split
 
 
 class FoodDataPreprocessor:
@@ -17,7 +18,8 @@ class FoodDataPreprocessor:
             history_path: str,
             recipes_path: str,
             max_history_len: int = 20,
-            sample_size: int = None
+            sample_size: int = None,
+            test_size: float = 0.2
     ):
         """
         Args:
@@ -26,9 +28,11 @@ class FoodDataPreprocessor:
             recipes_path: Path to recipes CSV (RecipeId, Name, AuthorId, CookTime, etc.)
             max_history_len: Maximum length of user history sequence
             sample_size: If set, randomly sample this many reviews for faster testing
+            test_size: Proportion of data to use for testing (default: 0.2 for 20%)
         """
         self.max_history_len = max_history_len
         self.sample_size = sample_size
+        self.test_size = test_size
 
         print("Loading datasets...")
 
@@ -199,9 +203,9 @@ class FoodDataPreprocessor:
         print(f"✓ User history dictionary created for {len(self.user_history_dict)} users")
 
     def _prepare_training_data(self):
-        """Prepare the training dataframe by merging reviews with recipe features."""
+        """Prepare the training dataframe by merging reviews with recipe features and split into train/test."""
         # Merge reviews with recipe features
-        self.training_df = self.reviews_df.merge(
+        full_df = self.reviews_df.merge(
             self.recipes_df,
             on='FoodId',
             how='left'
@@ -210,20 +214,38 @@ class FoodDataPreprocessor:
         print("Generating Position based on Rating...")
 
         # Sort by rating in descending order (best ratings first)
-        self.training_df = self.training_df.sort_values('Rating', ascending=False).reset_index(drop=True)
+        full_df = full_df.sort_values('Rating', ascending=False).reset_index(drop=True)
 
         # Assign position within each user's history
-        self.training_df['Position'] = self.training_df.groupby('UserId').cumcount()
+        full_df['Position'] = full_df.groupby('UserId').cumcount()
 
         # Cap positions at 9 (top 10 items)
-        self.training_df['Position'] = self.training_df['Position'].clip(upper=9)
+        full_df['Position'] = full_df['Position'].clip(upper=9)
 
         # Create binary engagement signals
-        self.training_df['HighRating'] = (self.training_df['Rating'] >= 4).astype(float)
-        self.training_df['HasReview'] = (~self.training_df['Review'].isna()).astype(float)
+        full_df['HighRating'] = (full_df['Rating'] >= 4).astype(float)
+        full_df['HasReview'] = (~full_df['Review'].isna()).astype(float)
 
-        print(f"Prepared {len(self.training_df)} training samples")
-        print(f"Position distribution:\n{self.training_df['Position'].value_counts().sort_index()}")
+        # Split into train and test sets
+        print(f"\nSplitting data into train ({int((1-self.test_size)*100)}%) and test ({int(self.test_size*100)}%) sets...")
+        self.train_df, self.test_df = train_test_split(
+            full_df,
+            test_size=self.test_size,
+            random_state=None  # No fixed seed - different split each time
+        )
+
+        # Reset indices
+        self.train_df = self.train_df.reset_index(drop=True)
+        self.test_df = self.test_df.reset_index(drop=True)
+
+        # Store full dataframe for backward compatibility
+        self.training_df = full_df
+
+        print(f"✓ Total samples: {len(full_df):,}")
+        print(f"✓ Training samples: {len(self.train_df):,}")
+        print(f"✓ Testing samples: {len(self.test_df):,}")
+        print(f"\nPosition distribution in training set:\n{self.train_df['Position'].value_counts().sort_index()}")
+        print(f"\nPosition distribution in testing set:\n{self.test_df['Position'].value_counts().sort_index()}")
 
     def get_dataset_info(self) -> Dict:
         """Returns information needed to initialize the model."""
@@ -238,20 +260,32 @@ class FoodDataPreprocessor:
     def save_preprocessed(self, output_dir: str):
         """
         Save preprocessed data for fast loading later.
+        Creates separate 'train' and 'test' subdirectories.
 
         Args:
-            output_dir: Directory to save preprocessed files
+            output_dir: Base directory to save preprocessed files
         """
-        os.makedirs(output_dir, exist_ok=True)
+        # Create train and test directories
+        train_dir = os.path.join(output_dir, 'train')
+        test_dir = os.path.join(output_dir, 'test')
+        os.makedirs(train_dir, exist_ok=True)
+        os.makedirs(test_dir, exist_ok=True)
 
         print(f"\nSaving preprocessed data to {output_dir}...")
+        print(f"  Train folder: {train_dir}")
+        print(f"  Test folder: {test_dir}")
 
-        # Save dataframes
-        self.training_df.to_pickle(os.path.join(output_dir, 'training_df.pkl'))
-        self.history_df.to_pickle(os.path.join(output_dir, 'history_df.pkl'))
-        self.recipes_df.to_pickle(os.path.join(output_dir, 'recipes_df.pkl'))
+        # Save TRAIN dataframes
+        self.train_df.to_pickle(os.path.join(train_dir, 'training_df.pkl'))
+        self.history_df.to_pickle(os.path.join(train_dir, 'history_df.pkl'))
+        self.recipes_df.to_pickle(os.path.join(train_dir, 'recipes_df.pkl'))
 
-        # Save mappings and metadata
+        # Save TEST dataframes
+        self.test_df.to_pickle(os.path.join(test_dir, 'training_df.pkl'))
+        self.history_df.to_pickle(os.path.join(test_dir, 'history_df.pkl'))
+        self.recipes_df.to_pickle(os.path.join(test_dir, 'recipes_df.pkl'))
+
+        # Save mappings and metadata (same for both)
         metadata = {
             'user_id_map': self.user_id_map,
             'food_id_map': self.food_id_map,
@@ -260,16 +294,29 @@ class FoodDataPreprocessor:
             'user_history_dict': self.user_history_dict,
             'available_nutrition_cols': self.available_nutrition_cols,
             'max_history_len': self.max_history_len,
+            'test_size': self.test_size,
         }
 
-        with open(os.path.join(output_dir, 'metadata.pkl'), 'wb') as f:
+        with open(os.path.join(train_dir, 'metadata.pkl'), 'wb') as f:
+            pickle.dump(metadata, f)
+        with open(os.path.join(test_dir, 'metadata.pkl'), 'wb') as f:
             pickle.dump(metadata, f)
 
-        print(f"✓ Saved training_df.pkl ({len(self.training_df):,} samples)")
-        print(f"✓ Saved history_df.pkl ({len(self.history_df):,} users)")
-        print(f"✓ Saved recipes_df.pkl ({len(self.recipes_df):,} recipes)")
-        print(f"✓ Saved metadata.pkl")
+        print(f"\n✓ TRAIN folder:")
+        print(f"  - Saved training_df.pkl ({len(self.train_df):,} samples)")
+        print(f"  - Saved history_df.pkl ({len(self.history_df):,} users)")
+        print(f"  - Saved recipes_df.pkl ({len(self.recipes_df):,} recipes)")
+        print(f"  - Saved metadata.pkl")
+        
+        print(f"\n✓ TEST folder:")
+        print(f"  - Saved training_df.pkl ({len(self.test_df):,} samples)")
+        print(f"  - Saved history_df.pkl ({len(self.history_df):,} users)")
+        print(f"  - Saved recipes_df.pkl ({len(self.recipes_df):,} recipes)")
+        print(f"  - Saved metadata.pkl")
+        
         print(f"\n✓ Preprocessing complete! Saved to {output_dir}")
+        print(f"  Use '{train_dir}' for training")
+        print(f"  Use '{test_dir}' for testing/evaluation")
 
     @classmethod
     def load_preprocessed(cls, input_dir: str):
@@ -303,6 +350,7 @@ class FoodDataPreprocessor:
         instance.user_history_dict = metadata['user_history_dict']
         instance.available_nutrition_cols = metadata['available_nutrition_cols']
         instance.max_history_len = metadata['max_history_len']
+        instance.test_size = metadata.get('test_size', 0.2)
 
         # Also need reviews_df for dataset creation
         instance.reviews_df = instance.training_df[['UserId', 'FoodId', 'Rating', 'Review']].copy()
@@ -489,7 +537,7 @@ if __name__ == "__main__":
                         help='Load preprocessed data from this directory')
 
     # Quick test mode - uncomment and modify paths for your setup
-    QUICK_TEST = False  # Set to True to enable quick test
+    QUICK_TEST = True  # Set to True to enable quick test
 
     if QUICK_TEST:
         print("🔥 QUICK TEST MODE ENABLED 🔥\n")
@@ -497,8 +545,8 @@ if __name__ == "__main__":
             'reviews': 'Datasets/reviews.csv',
             'history': 'Datasets/user_history.csv',
             'recipes': 'Datasets/recipes.csv',
-            'sample': 10000,  # Use 10K sample for quick testing
-            'save': 'preprocessed_data_10k',
+            'sample': None,
+            'save': 'preprocessed_data',
             'load': None
         })()
     else:
@@ -551,7 +599,7 @@ if __name__ == "__main__":
 
     nan_count = 0
     inf_count = 0
-    check_samples = len(dataset)
+    check_samples = 10000
 
     for i in range(check_samples):
         sample = dataset[i]

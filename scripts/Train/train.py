@@ -10,9 +10,9 @@ import sys
 
 # ============= SIMPLE PATH CONFIGURATION =============
 SCRIPT_DIR = Path(__file__).parent.absolute()
-PREPROCESSED_DIR = Path(SCRIPT_DIR) / 'my_preprocessed_data'
-OUTPUT_DIR = Path(SCRIPT_DIR) / 'Train' / 'model_outputs'
-PREPROCESSOR_SCRIPT = Path(SCRIPT_DIR) / 'food_preprocessor_simple.py'
+PREPROCESSED_DIR = Path(SCRIPT_DIR) / '../../preprocessed_data/train/'
+OUTPUT_DIR = Path(SCRIPT_DIR) / 'model_outputs'
+PREPROCESSOR_SCRIPT = Path(SCRIPT_DIR) / 'food_data_preprocessor.py'
 
 print(f"\n📂 Script Directory: {SCRIPT_DIR}")
 print(f"📂 Looking for preprocessed data: {PREPROCESSED_DIR}")
@@ -86,11 +86,7 @@ class SimpleTwoTowerModel(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 1)
         )
-        self.review_head = nn.Sequential(
-            nn.Linear(embedding_dim * 2, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
+
 
     def forward(self, user_ids, user_features, user_history, item_ids, item_features, positions):
         history_embeddings = self.item_id_embedding(user_history)
@@ -100,12 +96,11 @@ class SimpleTwoTowerModel(nn.Module):
 
         ranking_pred = self.ranking_head(combined).squeeze(-1)
         rating_pred = self.rating_head(combined).squeeze(-1)
-        review_pred = self.review_head(combined).squeeze(-1)
+
 
         return {
             'ranking': ranking_pred,
             'rating': rating_pred,
-            'review': review_pred
         }
 
 
@@ -115,7 +110,6 @@ def train_epoch(model, train_loader, optimizer, device):
     total_loss = 0
     loss_fn_ranking = nn.BCEWithLogitsLoss()
     loss_fn_rating = nn.MSELoss()
-    loss_fn_review = nn.BCEWithLogitsLoss()
 
     pbar = tqdm(train_loader, desc='Training')
     for batch in pbar:
@@ -138,9 +132,8 @@ def train_epoch(model, train_loader, optimizer, device):
 
         loss_ranking = loss_fn_ranking(predictions['ranking'], high_rating)
         loss_rating = loss_fn_rating(predictions['rating'], normalized_rating)
-        loss_review = loss_fn_review(predictions['review'], has_review)
 
-        loss = 0.4 * loss_ranking + 0.4 * loss_rating + 0.2 * loss_review
+        loss = 0.5 * loss_ranking + 0.5 * loss_rating
 
         loss.backward()
 
@@ -161,7 +154,6 @@ def evaluate(model, val_loader, device):
     total_loss = 0
     loss_fn_ranking = nn.BCEWithLogitsLoss()
     loss_fn_rating = nn.MSELoss()
-    loss_fn_review = nn.BCEWithLogitsLoss()
 
     with torch.no_grad():
         pbar = tqdm(val_loader, desc='Validating')
@@ -184,9 +176,8 @@ def evaluate(model, val_loader, device):
 
             loss_ranking = loss_fn_ranking(predictions['ranking'], high_rating)
             loss_rating = loss_fn_rating(predictions['rating'], normalized_rating)
-            loss_review = loss_fn_review(predictions['review'], has_review)
 
-            loss = 0.4 * loss_ranking + 0.4 * loss_rating + 0.2 * loss_review
+            loss = 0.5 * loss_ranking + 0.5 * loss_rating
 
             total_loss += loss.item()
             pbar.set_postfix({'loss': loss.item()})
@@ -204,7 +195,7 @@ def main():
     # ✅ FIXED HYPERPARAMETERS
     EMBEDDING_DIM = 64
     BATCH_SIZE = 256
-    NUM_EPOCHS = 10
+    NUM_EPOCHS = 8
     LEARNING_RATE = 1e-5
     VALIDATION_SPLIT = 0.2
 
@@ -215,6 +206,8 @@ def main():
 
     if torch.cuda.is_available():
         DEVICE = torch.device('cuda')
+        print("CUDA AVAILABLE")
+        print("DEVICE:", DEVICE)
 
     # Create output directory
     print("\n" + "=" * 70)
@@ -245,7 +238,7 @@ def main():
         if str(SCRIPT_DIR) not in sys.path:
             sys.path.insert(0, str(SCRIPT_DIR))
 
-        from scripts.food_data_preprocessor import FoodDataPreprocessor, FoodRecommendationDataset
+        from food_data_preprocessor import FoodDataPreprocessor, FoodRecommendationDataset
 
         preprocessor = FoodDataPreprocessor.load_preprocessed(str(PREPROCESSED_DIR))
         print("✓ Data loaded successfully!")

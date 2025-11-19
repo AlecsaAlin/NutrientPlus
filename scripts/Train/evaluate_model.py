@@ -312,7 +312,7 @@ def main():
         if str(SCRIPT_DIR) not in sys.path:
             sys.path.insert(0, str(SCRIPT_DIR))
 
-        from food_data_preprocessor import FoodDataPreprocessor, FoodRecommendationDataset
+        from scripts.Train.food_data_preprocessor import FoodDataPreprocessor, FoodRecommendationDataset
 
         preprocessor = FoodDataPreprocessor.load_preprocessed(str(PREPROCESSED_DIR))
         print("✓ Test data loaded successfully!")

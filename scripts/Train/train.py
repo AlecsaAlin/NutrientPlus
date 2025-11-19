@@ -195,7 +195,7 @@ def main():
     # ✅ FIXED HYPERPARAMETERS
     EMBEDDING_DIM = 64
     BATCH_SIZE = 256
-    NUM_EPOCHS = 8
+    NUM_EPOCHS = 10
     LEARNING_RATE = 1e-5
     VALIDATION_SPLIT = 0.2
 
@@ -238,7 +238,7 @@ def main():
         if str(SCRIPT_DIR) not in sys.path:
             sys.path.insert(0, str(SCRIPT_DIR))
 
-        from food_data_preprocessor import FoodDataPreprocessor, FoodRecommendationDataset
+        from scripts.Train.food_data_preprocessor import FoodDataPreprocessor, FoodRecommendationDataset
 
         preprocessor = FoodDataPreprocessor.load_preprocessed(str(PREPROCESSED_DIR))
         print("✓ Data loaded successfully!")

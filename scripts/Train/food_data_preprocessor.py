@@ -100,7 +100,7 @@ class FoodDataPreprocessor:
 
         # Identify available nutritional columns
         self.available_nutrition_cols = []
-        possible_cols = ['Calories', 'ProteinContent']
+        possible_cols = ['Calories', 'ProteinContent','FatContent','SugarContent','FiberContent', 'CarbohydrateContent']
 
         for col in possible_cols:
             if col in self.recipes_df.columns:
@@ -112,7 +112,15 @@ class FoodDataPreprocessor:
                 if col == 'Calories':
                     default_val = 200  # Reasonable default for a recipe
                 elif col == 'ProteinContent':
-                    default_val = 10  # Reasonable default
+                    default_val = 10
+                elif col == 'FatContent':
+                    default_val = 8
+                elif col == 'CarbohydrateContent':
+                    default_val = 25
+                elif col == 'SugarContent':
+                    default_val = 5
+                elif col == 'FiberContent':
+                    default_val = 3
                 else:
                     default_val = 0
 
@@ -131,6 +139,18 @@ class FoodDataPreprocessor:
                     # Cap at 500g protein
                     self.recipes_df.loc[self.recipes_df[col] > 500, col] = 500
                     # Set negative values to default
+                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
+                elif col == 'FatContent':
+                    self.recipes_df.loc[self.recipes_df[col] > 200, col] = 200
+                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
+                elif col == 'CarbohydrateContent':
+                    self.recipes_df.loc[self.recipes_df[col] > 500, col] = 500
+                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
+                elif col == 'SugarContent':
+                    self.recipes_df.loc[self.recipes_df[col] > 200, col] = 200
+                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
+                elif col == 'FiberContent':
+                    self.recipes_df.loc[self.recipes_df[col] > 100, col] = 100
                     self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
 
         print(f"Available nutritional columns: {self.available_nutrition_cols}")
@@ -466,11 +486,17 @@ class FoodRecommendationDataset(Dataset):
                 val = float(row[col])
                 # ✅ SAFE NORMALIZATION WITH CLIPPING
                 if col == 'Calories':
-                    # Normalize by 2000 calories, allow up to 6000
                     item_features_list.append(np.clip(val / 2000.0, 0, 3))
                 elif col == 'ProteinContent':
-                    # Normalize by 50g, allow up to 250g
                     item_features_list.append(np.clip(val / 50.0, 0, 5))
+                elif col == 'FatContent':
+                    item_features_list.append(np.clip(val / 50.0, 0, 4))
+                elif col == 'CarbohydrateContent':
+                    item_features_list.append(np.clip(val / 100.0, 0, 5))
+                elif col == 'SugarContent':
+                    item_features_list.append(np.clip(val / 50.0, 0, 4))
+                elif col == 'FiberContent':
+                    item_features_list.append(np.clip(val / 20.0, 0, 5))
                 else:
                     # Generic normalization for other nutrients
                     item_features_list.append(np.clip(val / 100.0, 0, 10))

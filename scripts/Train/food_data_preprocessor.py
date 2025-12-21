@@ -98,9 +98,24 @@ class FoodDataPreprocessor:
         # Clean recipes
         self.recipes_df.rename(columns={'RecipeId': 'FoodId'}, inplace=True)
 
+        self.max_values = {
+            'Calories': 19823.5,
+            'ProteinContent': 1878.3,
+            'FatContent': 2191.0,
+            'CarbohydrateContent': 5030.7,
+            'SugarContent': 4570.9,
+            'FiberContent': 835.7,
+            'TotalTimeMinutes': 480,
+            'CholesterolContent':9167.2,
+            'SodiumContent':1246921.1,
+            'CategoryID':312
+        }
+
         # Identify available nutritional columns
         self.available_nutrition_cols = []
-        possible_cols = ['Calories', 'ProteinContent','FatContent','SugarContent','FiberContent', 'CarbohydrateContent']
+        possible_cols = ['Calories', 'ProteinContent','FatContent','SugarContent','FiberContent',
+                         'CarbohydrateContent','CholesterolContent','SodiumContent','CategoryID']
+
 
         for col in possible_cols:
             if col in self.recipes_df.columns:
@@ -129,29 +144,10 @@ class FoodDataPreprocessor:
 
                 self.recipes_df.loc[:, col] = self.recipes_df[col].fillna(fill_val)
 
-                # ✅ REMOVE EXTREME OUTLIERS
-                if col == 'Calories':
-                    # Cap at 10,000 calories (extremely high but possible for party recipes)
-                    self.recipes_df.loc[self.recipes_df[col] > 10000, col] = 10000
-                    # Set negative values to default
-                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
-                elif col == 'ProteinContent':
-                    # Cap at 500g protein
-                    self.recipes_df.loc[self.recipes_df[col] > 500, col] = 500
-                    # Set negative values to default
-                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
-                elif col == 'FatContent':
-                    self.recipes_df.loc[self.recipes_df[col] > 200, col] = 200
-                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
-                elif col == 'CarbohydrateContent':
-                    self.recipes_df.loc[self.recipes_df[col] > 500, col] = 500
-                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
-                elif col == 'SugarContent':
-                    self.recipes_df.loc[self.recipes_df[col] > 200, col] = 200
-                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
-                elif col == 'FiberContent':
-                    self.recipes_df.loc[self.recipes_df[col] > 100, col] = 100
-                    self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
+                # ✅ CAP AT MAX VALUE
+                max_val = self.max_values.get(col, 1000)
+                self.recipes_df.loc[self.recipes_df[col] > max_val, col] = max_val
+                self.recipes_df.loc[self.recipes_df[col] < 0, col] = default_val
 
         print(f"Available nutritional columns: {self.available_nutrition_cols}")
 
@@ -315,6 +311,7 @@ class FoodDataPreprocessor:
             'available_nutrition_cols': self.available_nutrition_cols,
             'max_history_len': self.max_history_len,
             'test_size': self.test_size,
+            'max_values': self.max_values,
         }
 
         with open(os.path.join(train_dir, 'metadata.pkl'), 'wb') as f:
@@ -371,6 +368,7 @@ class FoodDataPreprocessor:
         instance.available_nutrition_cols = metadata['available_nutrition_cols']
         instance.max_history_len = metadata['max_history_len']
         instance.test_size = metadata.get('test_size', 0.2)
+        instance.max_values = metadata.get('max_values', {})
 
         # Also need reviews_df for dataset creation
         instance.reviews_df = instance.training_df[['UserId', 'FoodId', 'Rating', 'Review']].copy()
@@ -456,9 +454,9 @@ class FoodRecommendationDataset(Dataset):
             user_features = torch.tensor([
                 np.clip(avg_rating / 5.0, 0, 1),  # Clip to [0, 1]
                 np.clip(num_reviews / 100.0, 0, 1),  # Clip to [0, 1]
-                np.clip(avg_time / 180.0, 0, 3),  # Allow up to 540 min, then clip
-                0.0,  # placeholder for dietary preference
-                0.0,  # placeholder for another feature
+                np.clip(avg_time / 480.0, 0, 1),  # Allow up to 540 min, then clip
+                0.0,
+                0.0,
             ], dtype=torch.float32)
         else:
             user_features = torch.zeros(5, dtype=torch.float32)
@@ -484,30 +482,19 @@ class FoodRecommendationDataset(Dataset):
         for col in self.available_nutrition_cols:
             if col in row.index and not pd.isna(row[col]):
                 val = float(row[col])
-                # ✅ SAFE NORMALIZATION WITH CLIPPING
-                if col == 'Calories':
-                    item_features_list.append(np.clip(val / 2000.0, 0, 3))
-                elif col == 'ProteinContent':
-                    item_features_list.append(np.clip(val / 50.0, 0, 5))
-                elif col == 'FatContent':
-                    item_features_list.append(np.clip(val / 50.0, 0, 4))
-                elif col == 'CarbohydrateContent':
-                    item_features_list.append(np.clip(val / 100.0, 0, 5))
-                elif col == 'SugarContent':
-                    item_features_list.append(np.clip(val / 50.0, 0, 4))
-                elif col == 'FiberContent':
-                    item_features_list.append(np.clip(val / 20.0, 0, 5))
-                else:
-                    # Generic normalization for other nutrients
-                    item_features_list.append(np.clip(val / 100.0, 0, 10))
+                max_val = self.preprocessor.max_values.get(col, 1000)
+                normalized_val = val / max_val
+                normalized_val = np.clip(normalized_val, 0.0, 1.0)
+                item_features_list.append(normalized_val)
             else:
                 item_features_list.append(0.0)
 
         # Add time feature if available
         if 'TotalTimeMinutes' in row.index and not pd.isna(row['TotalTimeMinutes']):
             time_val = float(row['TotalTimeMinutes'])
-            # Normalize by 180 min (3 hours), allow up to 900 min (15 hours)
-            item_features_list.append(np.clip(time_val / 180.0, 0, 5))
+            max_time = self.preprocessor.max_values.get('TotalTimeMinutes', 480)
+            normalized_time = np.clip(time_val / max_time, 0.0, 1.0)
+            item_features_list.append(normalized_time)
         elif 'TotalTimeMinutes' in self.df.columns:
             item_features_list.append(0.0)
 
@@ -566,13 +553,12 @@ if __name__ == "__main__":
     QUICK_TEST = True  # Set to True to enable quick test
 
     if QUICK_TEST:
-        print("🔥 QUICK TEST MODE ENABLED 🔥\n")
         args = type('Args', (), {
-            'reviews': 'Datasets/reviews.csv',
-            'history': 'Datasets/user_history.csv',
-            'recipes': 'Datasets/recipes.csv',
+            'reviews': '../../Datasets/reviews.csv',
+            'history': '../../Datasets/user_history.csv',
+            'recipes': '../../Datasets/recipes.csv',
             'sample': None,
-            'save': 'preprocessed_data',
+            'save': '../../preprocessed_data',
             'load': None
         })()
     else:
@@ -580,7 +566,7 @@ if __name__ == "__main__":
 
     # Initialize preprocessor
     print("\n" + "=" * 70)
-    print("FOOD RECOMMENDATION DATA LOADER - WITH NaN/INF FIXES")
+    print("FOOD RECOMMENDATION DATA LOADER ")
     print("=" * 70)
 
     if args.load:

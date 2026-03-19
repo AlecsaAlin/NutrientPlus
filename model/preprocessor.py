@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 from collections import defaultdict
 import pickle
 import os
+from pathlib import Path
 from sklearn.model_selection import train_test_split
 
 
@@ -44,7 +45,8 @@ class FoodDataPreprocessor:
             self.reviews_df = pd.read_csv(reviews_path, encoding='utf-8', encoding_errors='ignore')
 
         # Use low_memory=False to avoid dtype warnings on large files
-        self.history_df = pd.read_csv(history_path, low_memory=False, encoding='utf-8', encoding_errors='ignore')
+        self.history_df = pd.read_csv(history_path, usecols=[0, 1], names=['user_id', 'history'],
+                                       header=0, encoding='utf-8', encoding_errors='ignore')
         self.recipes_df = pd.read_csv(recipes_path, encoding='utf-8', encoding_errors='ignore')
 
         print(f"Loaded {len(self.reviews_df)} reviews")
@@ -92,11 +94,13 @@ class FoodDataPreprocessor:
         # Parse history column
         self.history_df['parsed_history'] = self.history_df['history'].apply(parse_history)
 
-        # Rename user_id column for consistency
-        self.history_df.rename(columns={'user_id': 'UserId'}, inplace=True)
+        self.history_df.rename(columns={'user_id': 'UserId'}, inplace=True, errors='ignore')
 
-        # Clean recipes
-        self.recipes_df.rename(columns={'RecipeId': 'FoodId'}, inplace=True)
+        # Clean recipes — handle both possible column names from different dataset versions
+        if 'RecipeId' in self.recipes_df.columns:
+            self.recipes_df.rename(columns={'RecipeId': 'FoodId'}, inplace=True)
+        elif 'recipe_id' in self.recipes_df.columns:
+            self.recipes_df.rename(columns={'recipe_id': 'FoodId'}, inplace=True)
 
         self.max_values = {
             'Calories': 19823.5,
@@ -247,7 +251,7 @@ class FoodDataPreprocessor:
         self.train_df, self.test_df = train_test_split(
             full_df,
             test_size=self.test_size,
-            random_state=None  # No fixed seed - different split each time
+            random_state=42,
         )
 
         # Reset indices
@@ -396,139 +400,112 @@ class FoodDataPreprocessor:
 
 
 class FoodRecommendationDataset(Dataset):
-    """PyTorch Dataset for food recommendations."""
+    """
+    PyTorch Dataset for food recommendations.
+
+    All tensors are pre-computed as contiguous numpy arrays during __init__.
+    __getitem__ becomes a pure O(1) array index with no pandas, no Python
+    loops, and no per-sample tensor construction — eliminating the CPU
+    bottleneck that previously kept the GPU starved.
+    """
 
     def __init__(self, preprocessor: FoodDataPreprocessor):
-        self.preprocessor = preprocessor
-        self.df = preprocessor.training_df
-        self.user_history_dict = preprocessor.user_history_dict
-        self.user_id_map = preprocessor.user_id_map
-        self.food_id_map = preprocessor.food_id_map
-        self.max_history_len = preprocessor.max_history_len
-        self.available_nutrition_cols = preprocessor.available_nutrition_cols
+        self.preprocessor  = preprocessor
+        self.df            = preprocessor.training_df
+        max_h              = preprocessor.max_history_len
+        uid_map            = preprocessor.user_id_map
+        fid_map            = preprocessor.food_id_map
+        hist_dict          = preprocessor.user_history_dict
+        nutr_cols          = preprocessor.available_nutrition_cols
+        max_vals           = preprocessor.max_values
+        n                  = len(self.df)
 
-        # Compute user-level features
-        self._compute_user_features()
+        print(f"  Pre-computing tensors for {n:,} samples ...")
 
-    def _compute_user_features(self):
-        """Compute aggregated features for each user."""
-        user_stats = self.df.groupby('UserId').agg({
-            'Rating': ['mean', 'count'],
-        }).reset_index()
+        # ── 1. User IDs ────────────────────────────────────────────────────
+        self._user_ids = np.array(
+            [uid_map.get(u, 1) for u in self.df['UserId']], dtype=np.int64
+        )
 
+        # ── 2. User features ───────────────────────────────────────────────
+        user_stats = self.df.groupby('UserId').agg({'Rating': ['mean', 'count']}).reset_index()
         user_stats.columns = ['UserId', 'AvgRating', 'NumReviews']
-
-        # Add time preference if available
         if 'TotalTimeMinutes' in self.df.columns:
             time_stats = self.df.groupby('UserId')['TotalTimeMinutes'].mean().reset_index()
             time_stats.columns = ['UserId', 'AvgTimePreference']
             user_stats = user_stats.merge(time_stats, on='UserId', how='left')
-            # Fill NaN time preferences with default
             user_stats['AvgTimePreference'] = user_stats['AvgTimePreference'].fillna(30.0)
         else:
             user_stats['AvgTimePreference'] = 30.0
+        user_stats = user_stats.set_index('UserId')
 
-        self.user_features_df = user_stats
+        uf = np.zeros((n, 5), dtype=np.float32)
+        for i, uid in enumerate(self.df['UserId']):
+            if uid in user_stats.index:
+                row = user_stats.loc[uid]
+                uf[i, 0] = float(np.clip(row['AvgRating']        / 5.0,   0, 1))
+                uf[i, 1] = float(np.clip(row['NumReviews']       / 100.0, 0, 1))
+                uf[i, 2] = float(np.clip(row['AvgTimePreference']/ 480.0, 0, 1))
+        self._user_features = uf
+
+        # ── 3. User history (padded sequences) ─────────────────────────────
+        hist_arr = np.zeros((n, max_h), dtype=np.int64)
+        for i, uid in enumerate(self.df['UserId']):
+            h = hist_dict.get(uid, [])[:max_h]
+            hist_arr[i, :len(h)] = h
+        self._user_history = hist_arr
+
+        # ── 4. Item IDs ────────────────────────────────────────────────────
+        self._item_ids = np.array(
+            [fid_map.get(f, 0) for f in self.df['FoodId']], dtype=np.int64
+        )
+
+        # ── 5. Item features ───────────────────────────────────────────────
+        feat_cols = list(nutr_cols)
+        if 'TotalTimeMinutes' in self.df.columns:
+            feat_cols.append('TotalTimeMinutes')
+        if not feat_cols:
+            feat_cols = []
+
+        n_feat = max(len(feat_cols), 1)
+        item_feat = np.zeros((n, n_feat), dtype=np.float32)
+        for fi, col in enumerate(feat_cols):
+            if col in self.df.columns:
+                vals = self.df[col].fillna(0.0).values.astype(np.float32)
+                mv   = float(max_vals.get(col, 1000))
+                if mv > 0:
+                    item_feat[:, fi] = np.clip(vals / mv, 0.0, 1.0)
+        self._item_features = item_feat
+
+        # ── 6. Positions ───────────────────────────────────────────────────
+        self._positions = self.df['Position'].fillna(0).values.astype(np.int64)
+
+        # ── 7. Labels ──────────────────────────────────────────────────────
+        ratings = self.df['Rating'].fillna(2.5).values.astype(np.float32)
+        has_rev = self.df['HasReview'].fillna(0.0).values.astype(np.float32)
+        labels  = np.stack([
+            (ratings >= 4.0).astype(np.float32),
+            np.clip(ratings / 5.0, 0, 1),
+            has_rev,
+        ], axis=1)
+        self._labels = labels
+
+        print(f"  ✓ Pre-computation complete.")
 
     def __len__(self):
-        return len(self.df)
+        return len(self._user_ids)
 
     def __getitem__(self, idx) -> Tuple[torch.Tensor, ...]:
-        row = self.df.iloc[idx]
-
-        # 1. User ID
-        user_id = self.user_id_map.get(row['UserId'], 1)
-        user_id_tensor = torch.tensor(user_id, dtype=torch.long)
-
-        # 2. User Features (with safe normalization!)
-        user_stats = self.user_features_df[
-            self.user_features_df['UserId'] == row['UserId']
-            ]
-
-        if len(user_stats) > 0:
-            avg_rating = user_stats['AvgRating'].values[0]
-            num_reviews = user_stats['NumReviews'].values[0]
-            avg_time = user_stats['AvgTimePreference'].values[0]
-
-            # ✅ SAFE NORMALIZATION WITH CLIPPING
-            user_features = torch.tensor([
-                np.clip(avg_rating / 5.0, 0, 1),  # Clip to [0, 1]
-                np.clip(num_reviews / 100.0, 0, 1),  # Clip to [0, 1]
-                np.clip(avg_time / 480.0, 0, 1),  # Allow up to 540 min, then clip
-                0.0,
-                0.0,
-            ], dtype=torch.float32)
-        else:
-            user_features = torch.zeros(5, dtype=torch.float32)
-
-        # 3. User History
-        history = self.user_history_dict.get(row['UserId'], [])
-        history = history[:self.max_history_len]  # truncate if needed
-
-        # Pad to max_history_len
-        while len(history) < self.max_history_len:
-            history.append(0)  # 0 is padding
-
-        user_history = torch.tensor(history, dtype=torch.long)
-
-        # 4. Food/Item ID
-        item_id = self.food_id_map.get(row['FoodId'], 0)
-        item_id_tensor = torch.tensor(item_id, dtype=torch.long)
-
-        # 5. Food Features - dynamically build based on available columns (with safe normalization!)
-        item_features_list = []
-
-        # Add nutritional features that are available
-        for col in self.available_nutrition_cols:
-            if col in row.index and not pd.isna(row[col]):
-                val = float(row[col])
-                max_val = self.preprocessor.max_values.get(col, 1000)
-                normalized_val = val / max_val
-                normalized_val = np.clip(normalized_val, 0.0, 1.0)
-                item_features_list.append(normalized_val)
-            else:
-                item_features_list.append(0.0)
-
-        # Add time feature if available
-        if 'TotalTimeMinutes' in row.index and not pd.isna(row['TotalTimeMinutes']):
-            time_val = float(row['TotalTimeMinutes'])
-            max_time = self.preprocessor.max_values.get('TotalTimeMinutes', 480)
-            normalized_time = np.clip(time_val / max_time, 0.0, 1.0)
-            item_features_list.append(normalized_time)
-        elif 'TotalTimeMinutes' in self.df.columns:
-            item_features_list.append(0.0)
-
-        # If no features available, use a dummy feature
-        if not item_features_list:
-            item_features_list = [0.0]
-
-        item_features = torch.tensor(item_features_list, dtype=torch.float32)
-
-        # ✅ SAFETY CHECK FOR NaN/Inf BEFORE RETURNING
-        if torch.isnan(item_features).any() or torch.isinf(item_features).any():
-            print(f"⚠️ Warning: NaN/Inf in item_features at idx {idx}, replacing with zeros")
-            item_features = torch.nan_to_num(item_features, nan=0.0, posinf=1.0, neginf=0.0)
-
-        if torch.isnan(user_features).any() or torch.isinf(user_features).any():
-            print(f"⚠️ Warning: NaN/Inf in user_features at idx {idx}, replacing with defaults")
-            user_features = torch.nan_to_num(user_features, nan=0.0, posinf=1.0, neginf=0.0)
-
-        # 6. Position (from rating-based ranking)
-        position = torch.tensor(row.get('Position', 0), dtype=torch.long)
-
-        # 7. Labels (multi-task: [high_rating, normalized_rating, has_review])
-        rating = row['Rating']
-        if pd.isna(rating):
-            rating = 2.5  # Default to middle rating if missing
-
-        labels = torch.tensor([
-            float(rating >= 4.0),  # binary: rating >= 4
-            np.clip(rating / 5.0, 0, 1),  # ✅ normalized rating with clip
-            float(row['HasReview']) if not pd.isna(row['HasReview']) else 0.0,  # binary: wrote review
-        ], dtype=torch.float32)
-
-        return (user_id_tensor, user_features, user_history,
-                item_id_tensor, item_features, position, labels)
+        """O(1) array index — no pandas, no loops, no per-sample tensor construction."""
+        return (
+            torch.from_numpy(self._user_ids    [idx:idx+1]).squeeze(0),
+            torch.from_numpy(self._user_features[idx]),
+            torch.from_numpy(self._user_history [idx]),
+            torch.from_numpy(self._item_ids    [idx:idx+1]).squeeze(0),
+            torch.from_numpy(self._item_features[idx]),
+            torch.tensor(self._positions[idx],  dtype=torch.long),
+            torch.from_numpy(self._labels       [idx]),
+        )
 
 
 # Example usage
@@ -553,13 +530,19 @@ if __name__ == "__main__":
     QUICK_TEST = True  # Set to True to enable quick test
 
     if QUICK_TEST:
+        # Use absolute paths derived from this file's location so the script
+        # works correctly regardless of which directory it is run from.
+        _here     = Path(__file__).parent.absolute()   # .../model
+        _root     = _here.parent                        # .../NutrientPlus
+        _datasets = _root / 'data' / 'raw'
+        _prepdata = _root / 'data' / 'preprocessed'
         args = type('Args', (), {
-            'reviews': '../../Datasets/reviews.csv',
-            'history': '../../Datasets/user_history.csv',
-            'recipes': '../../Datasets/recipes.csv',
-            'sample': None,
-            'save': '../../preprocessed_data',
-            'load': None
+            'reviews': str(_datasets / 'reviews.csv'),
+            'history': str(_datasets / 'user_history.csv'),
+            'recipes': str(_datasets / 'recipes.csv'),
+            'sample':  None,
+            'save':    str(_prepdata),
+            'load':    None
         })()
     else:
         args = parser.parse_args()

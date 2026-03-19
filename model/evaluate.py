@@ -16,99 +16,12 @@ from sklearn.metrics import (
 )
 import sys
 
-# ============= SIMPLE PATH CONFIGURATION =============
-SCRIPT_DIR = Path(__file__).parent.absolute()
-PREPROCESSED_DIR = Path(SCRIPT_DIR) / '../../preprocessed_data/test/'  # Use TEST data
-MODEL_PATH = Path(SCRIPT_DIR) / 'model_outputs' / 'best_model.pt'
-OUTPUT_DIR = Path(SCRIPT_DIR) /  'evaluation_results'
+SCRIPT_DIR       = Path(__file__).parent.absolute()
+PREPROCESSED_DIR = SCRIPT_DIR.parent / 'data' / 'preprocessed' / 'test'
+MODEL_PATH       = SCRIPT_DIR / 'checkpoints' / 'best_model.pt'
+OUTPUT_DIR       = SCRIPT_DIR / 'results'
 
-print(f"\n📂 Script Directory: {SCRIPT_DIR}")
-print(f"📂 Looking for test data: {PREPROCESSED_DIR}")
-print(f"📂 Looking for model: {MODEL_PATH}")
-print(f"📂 Results will go to: {OUTPUT_DIR}")
-
-
-class UserTower(nn.Module):
-    """User representation tower - must match training architecture."""
-
-    def __init__(self, num_users, user_feature_dim, embedding_dim=32):
-        super(UserTower, self).__init__()
-        self.user_embedding = nn.Embedding(num_users + 1, embedding_dim, padding_idx=0)
-        self.user_feature_net = nn.Sequential(
-            nn.Linear(user_feature_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, embedding_dim)
-        )
-        self.history_lstm = nn.LSTM(embedding_dim, embedding_dim, batch_first=True)
-        self.fusion = nn.Linear(embedding_dim * 3, embedding_dim)
-
-    def forward(self, user_ids, user_features, user_history, item_embeddings):
-        user_id_emb = self.user_embedding(user_ids)
-        user_feat_emb = self.user_feature_net(user_features)
-        lstm_out, _ = self.history_lstm(item_embeddings)
-        history_emb = lstm_out[:, -1, :]
-        combined = torch.cat([user_id_emb, user_feat_emb, history_emb], dim=1)
-        user_repr = self.fusion(combined)
-        return user_repr
-
-
-class ItemTower(nn.Module):
-    """Item (recipe) representation tower - must match training architecture."""
-
-    def __init__(self, num_items, item_feature_dim, embedding_dim=32):
-        super(ItemTower, self).__init__()
-        self.item_embedding = nn.Embedding(num_items + 1, embedding_dim, padding_idx=0)
-        self.item_feature_net = nn.Sequential(
-            nn.Linear(item_feature_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, embedding_dim)
-        )
-        self.fusion = nn.Linear(embedding_dim * 2, embedding_dim)
-
-    def forward(self, item_ids, item_features):
-        item_id_emb = self.item_embedding(item_ids)
-        item_feat_emb = self.item_feature_net(item_features)
-        combined = torch.cat([item_id_emb, item_feat_emb], dim=1)
-        item_repr = self.fusion(combined)
-        return item_repr, item_id_emb
-
-
-class SimpleTwoTowerModel(nn.Module):
-    """Simple Two-Tower model - must match training architecture."""
-
-    def __init__(self, num_users, num_items, user_feature_dim, item_feature_dim, embedding_dim=32):
-        super(SimpleTwoTowerModel, self).__init__()
-        self.num_users = num_users
-        self.num_items = num_items
-        self.embedding_dim = embedding_dim
-        self.user_tower = UserTower(num_users, user_feature_dim, embedding_dim)
-        self.item_tower = ItemTower(num_items, item_feature_dim, embedding_dim)
-        self.item_id_embedding = nn.Embedding(num_items + 1, embedding_dim, padding_idx=0)
-
-        self.ranking_head = nn.Sequential(
-            nn.Linear(embedding_dim * 2, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-        self.rating_head = nn.Sequential(
-            nn.Linear(embedding_dim * 2, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-
-    def forward(self, user_ids, user_features, user_history, item_ids, item_features, positions):
-        history_embeddings = self.item_id_embedding(user_history)
-        user_repr = self.user_tower(user_ids, user_features, user_history, history_embeddings)
-        item_repr, _ = self.item_tower(item_ids, item_features)
-        combined = torch.cat([user_repr, item_repr], dim=1)
-
-        ranking_pred = self.ranking_head(combined).squeeze(-1)
-        rating_pred = self.rating_head(combined).squeeze(-1)
-
-        return {
-            'ranking': ranking_pred,
-            'rating': rating_pred
-        }
+from model import TwoTowerModel as SimpleTwoTowerModel
 
 
 def evaluate_model(model, test_loader, device):
@@ -312,7 +225,7 @@ def main():
         if str(SCRIPT_DIR) not in sys.path:
             sys.path.insert(0, str(SCRIPT_DIR))
 
-        from scripts.Train.food_data_preprocessor import FoodDataPreprocessor, FoodRecommendationDataset
+        from preprocessor import FoodDataPreprocessor, FoodRecommendationDataset
 
         preprocessor = FoodDataPreprocessor.load_preprocessed(str(PREPROCESSED_DIR))
         print("✓ Test data loaded successfully!")
@@ -351,7 +264,7 @@ def main():
     )
 
     # Load trained weights
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
     model = model.to(device)
 
     total_params = sum(p.numel() for p in model.parameters())

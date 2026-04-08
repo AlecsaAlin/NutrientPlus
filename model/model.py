@@ -14,11 +14,21 @@ class UserTower(nn.Module):
         self.history_lstm = nn.LSTM(embedding_dim, embedding_dim, batch_first=True)
         self.fusion       = nn.Linear(embedding_dim * 3, embedding_dim)
 
-    def forward(self, user_ids, user_features, user_history, item_embeddings):
+    def forward(self, user_ids, user_features, item_embeddings, hist_lengths=None):
         uid_emb  = self.user_embedding(user_ids)
         feat_emb = self.user_feature_net(user_features)
-        lstm_out, _ = self.history_lstm(item_embeddings)
-        hist_emb = lstm_out[:, -1, :]
+
+        if hist_lengths is not None:     
+            lengths_cpu = hist_lengths.clamp(min=1).cpu()
+            packed = torch.nn.utils.rnn.pack_padded_sequence(
+                item_embeddings, lengths_cpu, batch_first=True, enforce_sorted=False,
+            )
+            _, (hn, _) = self.history_lstm(packed)
+            hist_emb = hn.squeeze(0)               
+        else:
+            lstm_out, _ = self.history_lstm(item_embeddings)
+            hist_emb = lstm_out[:, -1, :]
+
         return self.fusion(torch.cat([uid_emb, feat_emb, hist_emb], dim=1))
 
 
@@ -44,18 +54,19 @@ class TwoTowerModel(nn.Module):
 
     def __init__(self, num_users, num_items, user_feature_dim, item_feature_dim, embedding_dim=64):
         super().__init__()
-        self.num_users         = num_users
-        self.num_items         = num_items
-        self.embedding_dim     = embedding_dim
-        self.user_tower        = UserTower(num_users, user_feature_dim, embedding_dim)
-        self.item_tower        = ItemTower(num_items, item_feature_dim, embedding_dim)
-        self.item_id_embedding = nn.Embedding(num_items + 1, embedding_dim, padding_idx=0)
-        self.ranking_head      = nn.Sequential(nn.Linear(embedding_dim * 2, 32), nn.ReLU(), nn.Linear(32, 1))
-        self.rating_head       = nn.Sequential(nn.Linear(embedding_dim * 2, 32), nn.ReLU(), nn.Linear(32, 1))
+        self.num_users     = num_users
+        self.num_items     = num_items
+        self.embedding_dim = embedding_dim
+        self.user_tower    = UserTower(num_users, user_feature_dim, embedding_dim)
+        self.item_tower    = ItemTower(num_items, item_feature_dim, embedding_dim)
+        self.ranking_head  = nn.Sequential(nn.Linear(embedding_dim * 2, 32), nn.ReLU(), nn.Linear(32, 1))
+        self.rating_head   = nn.Sequential(nn.Linear(embedding_dim * 2, 32), nn.ReLU(), nn.Linear(32, 1))
 
     def forward(self, user_ids, user_features, user_history, item_ids, item_features, positions):
-        hist_emb     = self.item_id_embedding(user_history)
-        user_repr    = self.user_tower(user_ids, user_features, user_history, hist_emb)
+
+        hist_emb     = self.item_tower.item_embedding(user_history)
+        hist_lengths = (user_history != 0).sum(dim=1)
+        user_repr    = self.user_tower(user_ids, user_features, hist_emb, hist_lengths)
         item_repr, _ = self.item_tower(item_ids, item_features)
         combined     = torch.cat([user_repr, item_repr], dim=1)
         return {
@@ -65,7 +76,4 @@ class TwoTowerModel(nn.Module):
             'item_repr': item_repr,
         }
 
-
-# Keep SimpleTwoTowerModel as an alias so existing checkpoints and
-# any code that still references the old name loads without errors.
 SimpleTwoTowerModel = TwoTowerModel

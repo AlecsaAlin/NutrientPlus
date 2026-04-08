@@ -28,19 +28,19 @@ from ga_reranker import (
     CandidateItem, build_candidates_from_model_output,
 )
 from model import TwoTowerModel as SimpleTwoTowerModel
+from ahp import AHPWeightComputer
 
 
 def ndcg_at_k(ranked_relevances: list, k: int = 10) -> float:
-    """Normalised Discounted Cumulative Gain at k given binary relevance values in rank order."""
+    """Normalised Discounted Cumulative Gain at k."""
     ranked = ranked_relevances[:k]
-    dcg    = sum(rel / np.log2(r + 2) for r, rel in enumerate(ranked))
-    ideal  = sorted(ranked_relevances, reverse=True)[:k]
-    idcg   = sum(rel / np.log2(r + 2) for r, rel in enumerate(ideal))
+    dcg  = sum(rel / np.log2(r + 2) for r, rel in enumerate(ranked))
+    ideal = sorted(ranked_relevances, reverse=True)[:k]
+    idcg = sum(rel / np.log2(r + 2) for r, rel in enumerate(ideal))
     return dcg / idcg if idcg > 0 else 0.0
 
 
 def nutritional_diversity(items: list, config: GAConfig) -> float:
-    """Fraction of calorie and protein bands covered by the recommendation list."""
     cal_hits, prot_hits = set(), set()
     for item in items:
         for i in range(len(config.calorie_bands) - 1):
@@ -55,23 +55,20 @@ def nutritional_diversity(items: list, config: GAConfig) -> float:
 
 
 def category_diversity(items: list) -> float:
-    """Ratio of unique food categories to list length."""
     if not items:
         return 0.0
     return min(len(set(i.category_id for i in items)) / len(items), 1.0)
 
 
 def novelty_score(items: list) -> float:
-    """Fraction of items the user has not previously seen."""
     if not items:
         return 0.0
     return sum(1 for i in items if not i.in_user_history) / len(items)
 
 
 def run_evaluation():
-    """Run model inference on the test set, then GA re-rank a sample of users and print both per-item and list-level metrics."""
     print("\n" + "=" * 70)
-    print("NUTRIENTPLUS  -  TWO-TOWER + GA RE-RANKER EVALUATION")
+    print("NUTRIENTPLUS  -  TWO-TOWER + SA-GA RE-RANKER EVALUATION")
     print("=" * 70)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -82,7 +79,7 @@ def run_evaluation():
     info         = preprocessor.get_dataset_info()
     print(f"  Users : {info['num_users']:,}  |  Items : {info['num_foods']:,}")
 
-    test_dataset = FoodRecommendationDataset(preprocessor)
+    test_dataset = FoodRecommendationDataset(preprocessor, df=preprocessor.test_df)
     test_loader  = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=0)
     print(f"  Test samples: {len(test_dataset):,}")
 
@@ -93,19 +90,32 @@ def run_evaluation():
         item_feature_dim = info["food_feature_dim"],
         embedding_dim    = 64,
     )
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
+    state_dict = torch.load(MODEL_PATH, map_location=device, weights_only=True)
+    model_keys = set(model.state_dict().keys())
+    state_dict = {k: v for k, v in state_dict.items() if k in model_keys}
+    model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
     model.eval()
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    ga_config = GAConfig()
+
+    DEMO_GOAL_TYPE            = 'maintain_weight'   # lose_weight | gain_muscle | maintain_weight | eat_healthier
+    DEMO_EXPLORATION_PREF     = 'balanced'           # conservative | balanced | adventurous
+
+    ahp     = AHPWeightComputer()
+    weights = ahp.compute_weights(DEMO_GOAL_TYPE, DEMO_EXPLORATION_PREF)
+    print(f"\n  AHP weights for ({DEMO_GOAL_TYPE}, {DEMO_EXPLORATION_PREF}):")
+    for k, v in weights.items():
+        print(f"    {k}: {v:.4f}")
+
+    ga_config = GAConfig(**weights)
     reranker  = GeneticReranker(ga_config)
     evaluator = FitnessEvaluator(ga_config)
 
     loss_fn_rank   = nn.BCEWithLogitsLoss()
     loss_fn_rating = nn.MSELoss()
 
-    all_rank_preds,  all_rate_preds  = [], []
+    all_rank_preds, all_rate_preds   = [], []
     all_rank_labels, all_rate_labels = [], []
     total_loss = total_rank_loss = total_rate_loss = 0.0
     user_item_scores: dict = {}
@@ -140,16 +150,14 @@ def run_evaluation():
             total_rate_loss += l_rate.item()
 
             rank_scores = torch.sigmoid(preds["ranking"]).cpu().numpy()
-            rate_scores = preds["rating"].cpu().numpy()
-            hl_np       = high_rating.cpu().numpy()
-            nr_np       = normalized_rating.cpu().numpy()
+            rate_raw = preds["rating"].cpu().numpy()
 
             all_rank_preds.extend(rank_scores)
-            all_rate_preds.extend(rate_scores)
-            all_rank_labels.extend(hl_np)
-            all_rate_labels.extend(nr_np)
+            all_rate_preds.extend(rate_raw)
+            all_rank_labels.extend(high_rating.cpu().numpy())
+            all_rate_labels.extend(normalized_rating.cpu().numpy())
 
-            for uid, iid, score, label in zip(uid_np, iid_np, rank_scores, hl_np):
+            for uid, iid, score, label in zip(uid_np, iid_np, rank_scores, high_rating.cpu().numpy()):
                 user_item_scores.setdefault(int(uid), []).append(
                     (int(iid), float(score), float(label))
                 )
@@ -161,8 +169,8 @@ def run_evaluation():
 
     bin_preds  = (all_rank_preds >= 0.5).astype(int)
     n_batches  = len(test_loader)
-    rate_pred5 = np.clip(all_rate_preds * 5, 1, 5)
-    rate_lbl5  = all_rate_labels * 5
+    rate_pred5 = np.clip(all_rate_preds  * 5.0, 1.0, 5.0)
+    rate_lbl5  = np.clip(all_rate_labels * 5.0, 1.0, 5.0)
 
     orig_metrics = {
         "overall": {
@@ -174,8 +182,8 @@ def run_evaluation():
         "high_rating_prediction": {
             "accuracy":  float(accuracy_score(all_rank_labels, bin_preds)),
             "precision": float(precision_score(all_rank_labels, bin_preds, zero_division=0)),
-            "recall":    float(recall_score(all_rank_labels, bin_preds, zero_division=0)),
-            "f1_score":  float(f1_score(all_rank_labels, bin_preds, zero_division=0)),
+            "recall":    float(recall_score(all_rank_labels,    bin_preds, zero_division=0)),
+            "f1_score":  float(f1_score(all_rank_labels,        bin_preds, zero_division=0)),
             "auc_roc":   float(roc_auc_score(all_rank_labels, all_rank_preds)),
         },
         "rating_prediction": {
@@ -192,16 +200,16 @@ def run_evaluation():
     available_nutrition_cols = preprocessor.available_nutrition_cols
     max_values               = preprocessor.max_values
     user_history_dict        = preprocessor.user_history_dict
-    reverse_user_map         = preprocessor.reverse_user_map
+    reverse_user_map         = getattr(preprocessor, 'reverse_user_map', {})
 
     eligible_users = [uid for uid, items in user_item_scores.items() if len(items) >= 10]
     sample_users   = eligible_users[:500]
-    print(f"\n── GA re-ranking ({len(sample_users)} users) ──")
+    print(f"\n── SA-GA re-ranking ({len(sample_users)} users) ──")
 
     baseline_store = {"ndcg": [], "nutrition": [], "category": [], "novelty": [], "fitness": []}
     ga_store       = {"ndcg": [], "nutrition": [], "category": [], "novelty": [], "fitness": []}
 
-    for uid in tqdm(sample_users, desc="GA Re-ranking"):
+    for uid in tqdm(sample_users, desc="SA-GA Re-ranking"):
         items        = user_item_scores[uid]
         top50        = sorted(items, key=lambda x: x[1], reverse=True)[:ga_config.candidate_pool_size]
         cand_label   = {x[0]: x[2] for x in top50}
@@ -235,7 +243,8 @@ def run_evaluation():
     def _mean(lst):
         return float(np.mean(lst)) if lst else 0.0
 
-    metric_keys  = ["ndcg_at_10", "nutritional_diversity", "category_diversity", "novelty_score", "composite_ga_fitness"]
+    metric_keys  = ["ndcg_at_10", "nutritional_diversity", "category_diversity",
+                    "novelty_score", "composite_ga_fitness"]
     baseline_agg = {
         "ndcg_at_10":            _mean(baseline_store["ndcg"]),
         "nutritional_diversity": _mean(baseline_store["nutrition"]),
@@ -266,16 +275,16 @@ def run_evaluation():
     print(f"  MAE       : {rp['mae']:.4f} stars")
 
     print("\n" + "=" * 70)
-    print("LIST-LEVEL METRICS")
+    print("LIST-LEVEL METRICS  (Baseline greedy vs SA-GA)")
     print("=" * 70)
     label_map = {
         "ndcg_at_10":            "NDCG@10",
         "nutritional_diversity": "Nutritional Diversity",
         "category_diversity":    "Category Diversity",
         "novelty_score":         "Novelty Score",
-        "composite_ga_fitness":  "Composite GA Fitness",
+        "composite_ga_fitness":  "Composite SA-GA Fitness",
     }
-    print(f"  {'Metric':<30} {'Baseline':>10} {'GA':>10} {'Delta':>10}")
+    print(f"  {'Metric':<30} {'Baseline':>10} {'SA-GA':>10} {'Delta':>10}")
     print("  " + "-" * 62)
     for key, label in label_map.items():
         b    = baseline_agg[key]
@@ -286,13 +295,17 @@ def run_evaluation():
     print()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_DIR / "evaluation_with_ga.json"
+    out_path = OUTPUT_DIR / "evaluation_with_saga.json"
     with open(out_path, "w") as f:
-        json.dump({"original_metrics": orig_metrics,
-                   "list_level_metrics": {"users_evaluated": len(sample_users),
-                                          "baseline_greedy": baseline_agg,
-                                          "ga_reranked": ga_agg,
-                                          "improvement": improvement}}, f, indent=2)
+        json.dump({
+            "original_metrics": orig_metrics,
+            "list_level_metrics": {
+                "users_evaluated":  len(sample_users),
+                "baseline_greedy":  baseline_agg,
+                "saga_reranked":    ga_agg,
+                "improvement":      improvement,
+            }
+        }, f, indent=2)
     print(f"✓ Results saved to: {out_path}")
     print("\n✅ EVALUATION COMPLETE!")
 

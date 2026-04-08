@@ -17,26 +17,36 @@ from model import TwoTowerModel
 
 
 def contrastive_loss(user_repr: torch.Tensor, item_repr: torch.Tensor,
-                     temperature: float = 0.07) -> torch.Tensor:
+                     temperature: float = 0.07,
+                     user_ids: torch.Tensor = None) -> torch.Tensor:
     """
-    InfoNCE in-batch negative sampling loss.
+    InfoNCE in-batch negative sampling loss with same-user masking.
+
     Treats each user's paired recipe as its positive and all other recipes
-    in the batch as negatives. Trains the towers to produce discriminative
-    embeddings for personalised retrieval, not just pointwise prediction.
+    in the batch as negatives.  When ``user_ids`` is provided, other items
+    from the **same user** are masked out instead of being treated as hard
+    negatives — they are valid positive interactions, not true negatives.
     """
     u      = F.normalize(user_repr, dim=-1)
     v      = F.normalize(item_repr, dim=-1)
-    logits = torch.matmul(u, v.T) / temperature
+    logits = torch.matmul(u, v.T) / temperature           # [B, B]
+
+    if user_ids is not None:
+        same_user = user_ids.unsqueeze(0) == user_ids.unsqueeze(1)  # [B, B]
+        same_user.fill_diagonal_(False)  
+        logits = logits.masked_fill(same_user, float('-inf'))
+
     labels = torch.arange(logits.shape[0], device=logits.device)
     return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2.0
 
 
 def train_epoch(model, train_loader, optimizer, device,
-                contrastive_weight=0.20, temperature=0.07):
+                contrastive_weight=0.20, temperature=0.07,
+                ranking_pos_weight: torch.Tensor = None):
     """Run one full training epoch and return average loss."""
     model.train()
     total_loss      = 0
-    loss_fn_ranking = nn.BCEWithLogitsLoss()
+    loss_fn_ranking = nn.BCEWithLogitsLoss(pos_weight=ranking_pos_weight)
     loss_fn_rating  = nn.MSELoss()
 
     pbar = tqdm(train_loader, desc='Training')
@@ -58,7 +68,8 @@ def train_epoch(model, train_loader, optimizer, device,
 
         l_rank = loss_fn_ranking(preds['ranking'], high_rating)
         l_rate = loss_fn_rating(preds['rating'],   normalized_rating)
-        l_ctr  = contrastive_loss(preds['user_repr'], preds['item_repr'], temperature)
+        l_ctr  = contrastive_loss(preds['user_repr'], preds['item_repr'],
+                                  temperature, user_ids=user_ids)
 
         loss = (1.0 - contrastive_weight) * (0.5 * l_rank + 0.5 * l_rate) + contrastive_weight * l_ctr
         loss.backward()
@@ -72,11 +83,12 @@ def train_epoch(model, train_loader, optimizer, device,
 
 
 def evaluate(model, val_loader, device,
-             contrastive_weight=0.20, temperature=0.07):
+             contrastive_weight=0.20, temperature=0.07,
+             ranking_pos_weight: torch.Tensor = None):
     """Evaluate the model on the validation set and return average loss."""
     model.eval()
     total_loss      = 0
-    loss_fn_ranking = nn.BCEWithLogitsLoss()
+    loss_fn_ranking = nn.BCEWithLogitsLoss(pos_weight=ranking_pos_weight)
     loss_fn_rating  = nn.MSELoss()
 
     with torch.no_grad():
@@ -98,7 +110,8 @@ def evaluate(model, val_loader, device,
 
             l_rank = loss_fn_ranking(preds['ranking'], high_rating)
             l_rate = loss_fn_rating(preds['rating'],   normalized_rating)
-            l_ctr  = contrastive_loss(preds['user_repr'], preds['item_repr'], temperature)
+            l_ctr  = contrastive_loss(preds['user_repr'], preds['item_repr'],
+                                      temperature, user_ids=user_ids)
 
             loss = (1.0 - contrastive_weight) * (0.5 * l_rank + 0.5 * l_rate) + contrastive_weight * l_ctr
             total_loss += loss.item()
@@ -113,9 +126,9 @@ def main():
     BATCH_SIZE           = 256
     NUM_EPOCHS           = 20
     LEARNING_RATE        = 1e-4
-    VALIDATION_SPLIT     = 0.2
-    CONTRASTIVE_WEIGHT   = 0.20
-    TEMPERATURE          = 0.07
+    VALIDATION_SPLIT     = 0.2  
+    CONTRASTIVE_WEIGHT   = 0.05
+    TEMPERATURE          = 0.10
     EARLY_STOP_PATIENCE  = 5
 
     if torch.cuda.is_available():
@@ -144,21 +157,43 @@ def main():
     info = preprocessor.get_dataset_info()
     print(f"✓ Users: {info['num_users']:,}  Items: {info['num_foods']:,}")
 
-    dataset    = FoodRecommendationDataset(preprocessor)
-    val_size   = int(len(dataset) * VALIDATION_SPLIT)
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
-    )
+    import pandas as pd
+    from sklearn.model_selection import train_test_split as sk_split
+
+    train_df_full = preprocessor.training_df 
+
+    user_counts   = train_df_full['UserId'].value_counts()
+    stratify_mask = train_df_full['UserId'].isin(user_counts[user_counts >= 2].index)
+    df_can_strat  = train_df_full[stratify_mask]
+    df_solo       = train_df_full[~stratify_mask]
+
+    if len(df_can_strat) > 0:
+        df_tr, df_val = sk_split(
+            df_can_strat,
+            test_size=VALIDATION_SPLIT,
+            random_state=42,
+            stratify=df_can_strat['UserId'],
+        )
+    else:
+        df_tr, df_val = sk_split(
+            train_df_full,
+            test_size=VALIDATION_SPLIT,
+            random_state=42,
+        )
+
+    df_tr  = pd.concat([df_tr, df_solo]).reset_index(drop=True)
+    df_val = df_val.reset_index(drop=True)
+
+    train_dataset = FoodRecommendationDataset(preprocessor, df=df_tr)
+    val_dataset   = FoodRecommendationDataset(preprocessor, df=df_val)
+
+    print(f"✓ Train: {len(train_dataset):,}  Val: {len(val_dataset):,}")
 
     NUM_WORKERS  = 0 if sys.platform == 'win32' else 2
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
     val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
-
-    print(f"✓ Train: {len(train_dataset):,}  Val: {len(val_dataset):,}")
 
     model = TwoTowerModel(
         num_users        = info['num_users'],
@@ -172,6 +207,12 @@ def main():
 
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+
+    num_pos = max(int((df_tr['HighRating'] == 1.0).sum()), 1)
+    num_neg = int((df_tr['HighRating'] == 0.0).sum())
+    pos_weight_val = num_neg / num_pos
+    ranking_pos_weight = torch.tensor([pos_weight_val], dtype=torch.float32).to(DEVICE)
+    print(f"✓ Class balance — pos: {num_pos:,}  neg: {num_neg:,}  pos_weight: {pos_weight_val:.2f}")
 
     print(f"\n{'='*70}")
     print(f"TRAINING  (contrastive_weight={CONTRASTIVE_WEIGHT}, temperature={TEMPERATURE})")
@@ -187,11 +228,13 @@ def main():
         print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}  (lr={optimizer.param_groups[0]['lr']:.2e})")
 
         train_loss = train_epoch(model, train_loader, optimizer, DEVICE,
-                                 contrastive_weight=CONTRASTIVE_WEIGHT, temperature=TEMPERATURE)
+                                 contrastive_weight=CONTRASTIVE_WEIGHT, temperature=TEMPERATURE,
+                                 ranking_pos_weight=ranking_pos_weight)
         train_losses.append(train_loss)
 
         val_loss = evaluate(model, val_loader, DEVICE,
-                            contrastive_weight=CONTRASTIVE_WEIGHT, temperature=TEMPERATURE)
+                            contrastive_weight=CONTRASTIVE_WEIGHT, temperature=TEMPERATURE,
+                            ranking_pos_weight=ranking_pos_weight)
         val_losses.append(val_loss)
 
         print(f"Train: {train_loss:.4f}  Val: {val_loss:.4f}")

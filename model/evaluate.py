@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 import json
@@ -24,24 +23,6 @@ OUTPUT_DIR       = SCRIPT_DIR / 'results'
 
 from model import TwoTowerModel as SimpleTwoTowerModel
 
-CONTRASTIVE_WEIGHT = 0.05
-TEMPERATURE        = 0.10
-
-
-def contrastive_loss(user_repr: torch.Tensor, item_repr: torch.Tensor,
-                     temperature: float = TEMPERATURE,
-                     user_ids: torch.Tensor = None) -> torch.Tensor:
-    """InfoNCE in-batch contrastive loss with same-user masking — identical to train.py."""
-    u      = F.normalize(user_repr, dim=-1)
-    v      = F.normalize(item_repr, dim=-1)
-    logits = torch.matmul(u, v.T) / temperature
-    if user_ids is not None:
-        same_user = user_ids.unsqueeze(0) == user_ids.unsqueeze(1)
-        same_user.fill_diagonal_(False)
-        logits = logits.masked_fill(same_user, float('-inf'))
-    labels = torch.arange(logits.shape[0], device=logits.device)
-    return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2.0
-
 
 def evaluate_model(model, test_loader, device):
     """Comprehensive model evaluation on the test set."""
@@ -55,7 +36,7 @@ def evaluate_model(model, test_loader, device):
     loss_fn_ranking = nn.BCEWithLogitsLoss()
     loss_fn_rating  = nn.MSELoss()
 
-    total_loss = total_ranking_loss = total_rating_loss = total_contrastive_loss = 0.0
+    total_loss = total_ranking_loss = total_rating_loss = 0.0
 
     print("\n" + "=" * 70)
     print("RUNNING EVALUATION ON TEST SET")
@@ -79,23 +60,17 @@ def evaluate_model(model, test_loader, device):
             high_rating       = labels[:, 0]
             normalized_rating = labels[:, 1]
 
-            loss_ranking     = loss_fn_ranking(predictions['ranking'], high_rating)
-            loss_rating      = loss_fn_rating(predictions['rating'],   normalized_rating)
-            loss_contrastive = contrastive_loss(predictions['user_repr'], predictions['item_repr'],
-                                                 user_ids=user_ids)
-            loss = (
-                (1.0 - CONTRASTIVE_WEIGHT) * (0.5 * loss_ranking + 0.5 * loss_rating)
-                + CONTRASTIVE_WEIGHT * loss_contrastive
-            )
+            loss_ranking = loss_fn_ranking(predictions['ranking'], high_rating)
+            loss_rating  = loss_fn_rating(predictions['rating'],   normalized_rating)
+            loss         = 0.5 * loss_ranking + 0.5 * loss_rating
 
-            total_loss             += loss.item()
-            total_ranking_loss     += loss_ranking.item()
-            total_rating_loss      += loss_rating.item()
-            total_contrastive_loss += loss_contrastive.item()
+            total_loss         += loss.item()
+            total_ranking_loss += loss_ranking.item()
+            total_rating_loss  += loss_rating.item()
 
+            # ranking head uses BCEWithLogitsLoss — needs sigmoid to get probabilities
             ranking_probs = torch.sigmoid(predictions['ranking']).cpu().numpy()
-
-            rating_raw = predictions['rating'].cpu().numpy()
+            rating_raw    = predictions['rating'].cpu().numpy()
 
             all_ranking_preds.extend(ranking_probs)
             all_rating_preds.extend(rating_raw)
@@ -107,10 +82,9 @@ def evaluate_model(model, test_loader, device):
     all_ranking_labels = np.array(all_ranking_labels)
     all_rating_labels  = np.array(all_rating_labels)
 
-    avg_loss             = total_loss             / len(test_loader)
-    avg_ranking_loss     = total_ranking_loss     / len(test_loader)
-    avg_rating_loss      = total_rating_loss      / len(test_loader)
-    avg_contrastive_loss = total_contrastive_loss / len(test_loader)
+    avg_loss         = total_loss         / len(test_loader)
+    avg_ranking_loss = total_ranking_loss / len(test_loader)
+    avg_rating_loss  = total_rating_loss  / len(test_loader)
 
     ranking_binary_preds = (all_ranking_preds >= 0.5).astype(int)
 
@@ -124,7 +98,6 @@ def evaluate_model(model, test_loader, device):
     except Exception:
         ranking_auc = 0.0
 
-   
     rating_preds_scaled  = np.clip(all_rating_preds,  0.0, 1.0) * 5.0
     rating_labels_scaled = np.clip(all_rating_labels, 0.0, 1.0) * 5.0
     rating_preds_scaled  = np.clip(rating_preds_scaled,  1.0, 5.0)
@@ -139,11 +112,10 @@ def evaluate_model(model, test_loader, device):
 
     results = {
         'overall': {
-            'total_loss':        float(avg_loss),
-            'ranking_loss':      float(avg_ranking_loss),
-            'rating_loss':       float(avg_rating_loss),
-            'contrastive_loss':  float(avg_contrastive_loss),
-            'num_samples':       int(len(all_ranking_labels)),
+            'total_loss':    float(avg_loss),
+            'ranking_loss':  float(avg_ranking_loss),
+            'rating_loss':   float(avg_rating_loss),
+            'num_samples':   int(len(all_ranking_labels)),
         },
         'high_rating_prediction': {
             'accuracy':  float(ranking_accuracy),
@@ -168,14 +140,14 @@ def print_results(results):
     print("EVALUATION RESULTS")
     print("=" * 70)
 
-    print("\n📊 OVERALL METRICS:")
+    print("\nOVERALL METRICS:")
     print(f"  Total Loss:        {results['overall']['total_loss']:.4f}")
     print(f"  Ranking Loss:      {results['overall']['ranking_loss']:.4f}")
     print(f"  Rating Loss:       {results['overall']['rating_loss']:.4f}")
     print(f"  Samples Evaluated: {results['overall']['num_samples']:,}")
 
     hr = results['high_rating_prediction']
-    print("\n🎯 HIGH RATING PREDICTION (Binary: Rating ≥ 4):")
+    print("\nHIGH RATING PREDICTION (Binary: Rating >= 4):")
     print(f"  Accuracy  : {hr['accuracy']:.4f}  ({hr['accuracy']*100:.2f}%)")
     print(f"  Precision : {hr['precision']:.4f}")
     print(f"  Recall    : {hr['recall']:.4f}")
@@ -183,11 +155,11 @@ def print_results(results):
     print(f"  AUC-ROC   : {hr['auc_roc']:.4f}")
 
     rp = results['rating_prediction']
-    print("\n⭐ RATING PREDICTION (1-5 Stars):")
+    print("\nRATING PREDICTION (1-5 Stars):")
     print(f"  RMSE              : {rp['rmse']:.4f} stars")
     print(f"  MAE               : {rp['mae']:.4f} stars")
-    print(f"  Accuracy (±0.5 ★) : {rp['accuracy_within_0.5_stars']:.4f}  ({rp['accuracy_within_0.5_stars']*100:.2f}%)")
-    print(f"  Accuracy (±1.0 ★) : {rp['accuracy_within_1.0_stars']:.4f}  ({rp['accuracy_within_1.0_stars']*100:.2f}%)")
+    print(f"  Accuracy (+-0.5)  : {rp['accuracy_within_0.5_stars']:.4f}  ({rp['accuracy_within_0.5_stars']*100:.2f}%)")
+    print(f"  Accuracy (+-1.0)  : {rp['accuracy_within_1.0_stars']:.4f}  ({rp['accuracy_within_1.0_stars']*100:.2f}%)")
 
     print("\n" + "=" * 70)
 

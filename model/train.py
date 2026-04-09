@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from pathlib import Path
@@ -16,32 +15,7 @@ OUTPUT_DIR       = Path(SCRIPT_DIR) / 'checkpoints'
 from model import TwoTowerModel
 
 
-def contrastive_loss(user_repr: torch.Tensor, item_repr: torch.Tensor,
-                     temperature: float = 0.07,
-                     user_ids: torch.Tensor = None) -> torch.Tensor:
-    """
-    InfoNCE in-batch negative sampling loss with same-user masking.
-
-    Treats each user's paired recipe as its positive and all other recipes
-    in the batch as negatives.  When ``user_ids`` is provided, other items
-    from the **same user** are masked out instead of being treated as hard
-    negatives — they are valid positive interactions, not true negatives.
-    """
-    u      = F.normalize(user_repr, dim=-1)
-    v      = F.normalize(item_repr, dim=-1)
-    logits = torch.matmul(u, v.T) / temperature           # [B, B]
-
-    if user_ids is not None:
-        same_user = user_ids.unsqueeze(0) == user_ids.unsqueeze(1)  # [B, B]
-        same_user.fill_diagonal_(False)  
-        logits = logits.masked_fill(same_user, float('-inf'))
-
-    labels = torch.arange(logits.shape[0], device=logits.device)
-    return (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2.0
-
-
 def train_epoch(model, train_loader, optimizer, device,
-                contrastive_weight=0.20, temperature=0.07,
                 ranking_pos_weight: torch.Tensor = None):
     """Run one full training epoch and return average loss."""
     model.train()
@@ -68,22 +42,21 @@ def train_epoch(model, train_loader, optimizer, device,
 
         l_rank = loss_fn_ranking(preds['ranking'], high_rating)
         l_rate = loss_fn_rating(preds['rating'],   normalized_rating)
-        l_ctr  = contrastive_loss(preds['user_repr'], preds['item_repr'],
-                                  temperature, user_ids=user_ids)
+        loss   = 0.5 * l_rank + 0.5 * l_rate
 
-        loss = (1.0 - contrastive_weight) * (0.5 * l_rank + 0.5 * l_rate) + contrastive_weight * l_ctr
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
-        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'ctr': f'{l_ctr.item():.4f}'})
+        pbar.set_postfix({'loss': f'{loss.item():.4f}',
+                          'rank': f'{l_rank.item():.4f}',
+                          'rate': f'{l_rate.item():.4f}'})
 
     return total_loss / len(train_loader)
 
 
 def evaluate(model, val_loader, device,
-             contrastive_weight=0.20, temperature=0.07,
              ranking_pos_weight: torch.Tensor = None):
     """Evaluate the model on the validation set and return average loss."""
     model.eval()
@@ -110,10 +83,8 @@ def evaluate(model, val_loader, device,
 
             l_rank = loss_fn_ranking(preds['ranking'], high_rating)
             l_rate = loss_fn_rating(preds['rating'],   normalized_rating)
-            l_ctr  = contrastive_loss(preds['user_repr'], preds['item_repr'],
-                                      temperature, user_ids=user_ids)
+            loss   = 0.5 * l_rank + 0.5 * l_rate
 
-            loss = (1.0 - contrastive_weight) * (0.5 * l_rank + 0.5 * l_rate) + contrastive_weight * l_ctr
             total_loss += loss.item()
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
@@ -122,14 +93,12 @@ def evaluate(model, val_loader, device,
 
 def main():
     """Load data, build model, run training loop with early stopping."""
-    EMBEDDING_DIM        = 64
-    BATCH_SIZE           = 256
-    NUM_EPOCHS           = 20
-    LEARNING_RATE        = 1e-4
-    VALIDATION_SPLIT     = 0.2  
-    CONTRASTIVE_WEIGHT   = 0.05
-    TEMPERATURE          = 0.10
-    EARLY_STOP_PATIENCE  = 5
+    EMBEDDING_DIM       = 64
+    BATCH_SIZE          = 256
+    NUM_EPOCHS          = 20
+    LEARNING_RATE       = 1e-4
+    VALIDATION_SPLIT    = 0.2
+    EARLY_STOP_PATIENCE = 5
 
     if torch.cuda.is_available():
         DEVICE = torch.device('cuda')
@@ -160,7 +129,7 @@ def main():
     import pandas as pd
     from sklearn.model_selection import train_test_split as sk_split
 
-    train_df_full = preprocessor.training_df 
+    train_df_full = preprocessor.training_df
 
     user_counts   = train_df_full['UserId'].value_counts()
     stratify_mask = train_df_full['UserId'].isin(user_counts[user_counts >= 2].index)
@@ -215,7 +184,7 @@ def main():
     print(f"✓ Class balance — pos: {num_pos:,}  neg: {num_neg:,}  pos_weight: {pos_weight_val:.2f}")
 
     print(f"\n{'='*70}")
-    print(f"TRAINING  (contrastive_weight={CONTRASTIVE_WEIGHT}, temperature={TEMPERATURE})")
+    print(f"TRAINING  (loss = 0.5×BCE + 0.5×MSE  |  attention + element-wise product)")
     print(f"{'='*70}")
 
     train_losses, val_losses = [], []
@@ -228,12 +197,10 @@ def main():
         print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}  (lr={optimizer.param_groups[0]['lr']:.2e})")
 
         train_loss = train_epoch(model, train_loader, optimizer, DEVICE,
-                                 contrastive_weight=CONTRASTIVE_WEIGHT, temperature=TEMPERATURE,
                                  ranking_pos_weight=ranking_pos_weight)
         train_losses.append(train_loss)
 
         val_loss = evaluate(model, val_loader, DEVICE,
-                            contrastive_weight=CONTRASTIVE_WEIGHT, temperature=TEMPERATURE,
                             ranking_pos_weight=ranking_pos_weight)
         val_losses.append(val_loss)
 

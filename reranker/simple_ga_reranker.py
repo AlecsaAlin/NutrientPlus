@@ -30,7 +30,6 @@ class SimpleGAConfig:
     crossover_rate: float = 0.70
     elite_fraction: float = 0.10
 
-    # Fixed weights — same defaults as GAConfig, no AHP derivation
     w_relevance: float = 0.50
     w_nutrition: float = 0.25
     w_category:  float = 0.15
@@ -138,12 +137,10 @@ class SimpleGeneticReranker:
         elite_n     = max(1, int(self.cfg.elite_fraction * self.cfg.population_size))
 
         for _ in range(self.cfg.num_generations):
-            # Sort by fitness (descending)
             paired     = sorted(zip(fitness, population), key=lambda x: x[0], reverse=True)
             fitness    = [p[0] for p in paired]
             population = [p[1] for p in paired]
 
-            # Update global best
             if fitness[0] > best_fit:
                 best_fit   = fitness[0]
                 best_chrom = copy.deepcopy(population[0])
@@ -162,11 +159,10 @@ class SimpleGeneticReranker:
 
                 child_fit = self.evaluator.evaluate(child)
 
-                # Mutation — strictly greedy: only keep if fitness improves
                 if random.random() < self.cfg.mutation_rate:
                     mutated     = self._mutate(child, candidates)
                     mutated_fit = self.evaluator.evaluate(mutated)
-                    if mutated_fit > child_fit:          # strictly better only
+                    if mutated_fit > child_fit:          
                         child     = mutated
                         child_fit = mutated_fit
 
@@ -178,9 +174,6 @@ class SimpleGeneticReranker:
 
         return best_chrom
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _init_population(
         self, candidates: List[CandidateItem], k: int

@@ -41,7 +41,6 @@ from model import TwoTowerModel
 from preprocessor import FoodDataPreprocessor, FoodRecommendationDataset
 
 
-# ── evaluation helpers ────────────────────────────────────────────────
 
 def ndcg_at_k(ranked_relevances: list, k: int = 10) -> float:
     ranked = ranked_relevances[:k]
@@ -87,10 +86,9 @@ def mean_store(store) -> dict:
     return {k: float(np.mean(v)) if v else 0.0 for k, v in store.items()}
 
 
-# ── main ──────────────────────────────────────────────────────────────
 
 def main():
-    NUM_USERS = 500          # users to evaluate per reranker
+    NUM_USERS = 500       
 
     GOAL_TYPE   = 'maintain_weight'
     EXPLORATION = 'balanced'
@@ -102,7 +100,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n✓ Device : {device}")
 
-    # ── load data ────────────────────────────────────────────────────
     preprocessor = FoodDataPreprocessor.load_preprocessed(str(PREPROCESSED_DIR))
     info         = preprocessor.get_dataset_info()
     print(f"  Users  : {info['num_users']:,}   Items : {info['num_foods']:,}")
@@ -111,7 +108,6 @@ def main():
     test_loader  = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=0)
     print(f"  Test samples : {len(test_dataset):,}")
 
-    # ── load model ───────────────────────────────────────────────────
     model = TwoTowerModel(
         num_users        = info["num_users"],
         num_items        = info["num_foods"],
@@ -126,7 +122,6 @@ def main():
     model = model.to(device).eval()
     print(f"  Parameters : {sum(p.numel() for p in model.parameters()):,}")
 
-    # ── two-tower inference ──────────────────────────────────────────
     print("\n── Two-tower inference ──")
     user_item_scores: dict = {}
 
@@ -156,7 +151,6 @@ def main():
     print(f"  Eligible users  : {len(eligible_users):,}")
     print(f"  Users to eval   : {len(sample_users)}")
 
-    # ── build shared candidates dict ─────────────────────────────────
     recipes_df               = preprocessor.recipes_df
     food_id_map              = preprocessor.food_id_map
     available_nutrition_cols = preprocessor.available_nutrition_cols
@@ -164,7 +158,6 @@ def main():
     user_history_dict        = preprocessor.user_history_dict
     reverse_user_map         = getattr(preprocessor, 'reverse_user_map', {})
 
-    # Pre-build candidates list for every sample user
     all_candidates = {}
     all_cand_labels = {}
     for uid in sample_users:
@@ -189,7 +182,6 @@ def main():
     eval_users = list(all_candidates.keys())
     print(f"  Users with ≥10 candidates : {len(eval_users)}")
 
-    # ── PSO+AHP reranker ─────────────────────────────────────────────
     print("\n── PSO+AHP Re-ranking ──")
     ahp     = AHPWeightComputer()
     weights = ahp.compute_weights(GOAL_TYPE, EXPLORATION)
@@ -226,9 +218,8 @@ def main():
     pso_agg   = mean_store(pso_store)
     base_agg  = mean_store(base_store)
 
-    # ── Simple GA reranker ───────────────────────────────────────────
     print("\n── Simple GA Re-ranking ──")
-    sga_config   = SimpleGAConfig()         # fixed default weights
+    sga_config   = SimpleGAConfig()       
     sga_reranker = SimpleGeneticReranker(sga_config, seed=42)
     sga_eval     = SimpleFitnessEvaluator(sga_config)
 
@@ -247,7 +238,6 @@ def main():
     sga_time = time.perf_counter() - t0
     sga_agg  = mean_store(sga_store)
 
-    # ── print results ────────────────────────────────────────────────
     METRIC_LABELS = {
         "ndcg":      "NDCG@10",
         "nutrition": "Nutritional Diversity",
@@ -275,7 +265,6 @@ def main():
     speedup = pso_time / sga_time if sga_time > 0 else float('inf')
     print(f"  PSO+AHP is {speedup:.2f}× {'slower' if speedup > 1 else 'faster'} than Simple GA")
 
-    # ── save ─────────────────────────────────────────────────────────
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUTPUT_DIR / "comparison_pso_ahp_vs_simple_ga.json"
     result = {

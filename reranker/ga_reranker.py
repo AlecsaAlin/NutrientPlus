@@ -59,10 +59,7 @@ class GAConfig:
     sa_cooling_rate: float = 0.92
     sa_min_temperature: float = 1e-4
 
-    # --- PSO-guided mutation parameters ---
-    # Cognitive: probability of replacing toward personal best 
     pso_cognitive: float = 0.4
-    # Social: probability of replacing toward global best 
     pso_social: float = 0.3
 
     pso_inertia: float = 0.9

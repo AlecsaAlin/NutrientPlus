@@ -18,9 +18,7 @@ class UserTower(nn.Module):
         self.user_feature_net = nn.Sequential(
             nn.Linear(user_feature_dim, 64), nn.ReLU(), nn.Linear(64, embedding_dim)
         )
-        # Additive attention over raw item embeddings — single linear scoring
-        # layer replaces the entire LSTM.  Padding tokens are masked to -inf
-        # before softmax so they contribute zero weight.
+
         self.history_attention = nn.Linear(embedding_dim, 1)
         self.fusion = nn.Linear(embedding_dim * 3, embedding_dim)
 
@@ -28,16 +26,13 @@ class UserTower(nn.Module):
         uid_emb  = self.user_embedding(user_ids)
         feat_emb = self.user_feature_net(user_features)
 
-        # Attention directly on item embeddings — fully parallel, no LSTM.
-        # Clamp hist_lengths to min=1 so users with zero history always expose
-        # at least one position to softmax (avoids all-inf → NaN).
-        attn_scores = self.history_attention(item_embeddings).squeeze(-1)  # [B, T]
+        attn_scores = self.history_attention(item_embeddings).squeeze(-1) 
         if hist_lengths is not None:
             eff_lengths = hist_lengths.clamp(min=1).to(item_embeddings.device)
             mask = torch.arange(item_embeddings.size(1), device=item_embeddings.device).unsqueeze(0) >= eff_lengths.unsqueeze(1)
             attn_scores = attn_scores.masked_fill(mask, float('-inf'))
-        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)         # [B, T, 1]
-        hist_emb = (attn_weights * item_embeddings).sum(dim=1)             # [B, D]
+        attn_weights = F.softmax(attn_scores, dim=1).unsqueeze(-1)         
+        hist_emb = (attn_weights * item_embeddings).sum(dim=1)          
 
         return self.fusion(torch.cat([uid_emb, feat_emb, hist_emb], dim=1))
 
@@ -74,7 +69,6 @@ class TwoTowerModel(nn.Module):
         self.embedding_dim = embedding_dim
         self.user_tower    = UserTower(num_users, user_feature_dim, embedding_dim)
         self.item_tower    = ItemTower(num_items, item_feature_dim, embedding_dim)
-        # Input: [user_repr, item_repr, user_repr * item_repr] = 3 × embedding_dim
         self.ranking_head = nn.Sequential(
             nn.Linear(embedding_dim * 3, 64), nn.ReLU(),
             nn.Dropout(0.2),
@@ -93,7 +87,6 @@ class TwoTowerModel(nn.Module):
         hist_lengths = (user_history != 0).sum(dim=1)
         user_repr    = self.user_tower(user_ids, user_features, hist_emb, hist_lengths)
         item_repr, _ = self.item_tower(item_ids, item_features)
-        # Element-wise product captures multiplicative user-item interactions
         interaction  = user_repr * item_repr
         combined     = torch.cat([user_repr, item_repr, interaction], dim=1)
         return {
@@ -103,7 +96,4 @@ class TwoTowerModel(nn.Module):
             'item_repr': item_repr,
         }
 
-
-# Keep SimpleTwoTowerModel as an alias so existing checkpoints and
-# any code that still references the old name loads without errors.
 SimpleTwoTowerModel = TwoTowerModel

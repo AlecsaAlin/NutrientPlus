@@ -23,6 +23,7 @@ class UserTower(nn.Module):
         self.fusion = nn.Linear(embedding_dim * 3, embedding_dim)
 
     def forward(self, user_ids, user_features, item_embeddings, hist_lengths=None):
+        user_ids = user_ids.clamp(0, self.user_embedding.num_embeddings - 1)
         uid_emb  = self.user_embedding(user_ids)
         feat_emb = self.user_feature_net(user_features)
 
@@ -49,6 +50,7 @@ class ItemTower(nn.Module):
         self.fusion = nn.Linear(embedding_dim * 2, embedding_dim)
 
     def forward(self, item_ids, item_features):
+        item_ids = item_ids.clamp(0, self.item_embedding.num_embeddings - 1)
         id_emb   = self.item_embedding(item_ids)
         feat_emb = self.item_feature_net(item_features)
         return self.fusion(torch.cat([id_emb, feat_emb], dim=1)), id_emb
@@ -83,6 +85,7 @@ class TwoTowerModel(nn.Module):
         )
 
     def forward(self, user_ids, user_features, user_history, item_ids, item_features, positions):
+        user_history = user_history.clamp(0, self.item_tower.item_embedding.num_embeddings - 1)
         hist_emb     = self.item_tower.item_embedding(user_history)
         hist_lengths = (user_history != 0).sum(dim=1)
         user_repr    = self.user_tower(user_ids, user_features, hist_emb, hist_lengths)

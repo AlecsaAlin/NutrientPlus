@@ -392,18 +392,22 @@ def build_candidates_from_model_output(
     food_id_map: dict,
     available_nutrition_cols: list,
     max_values: dict,
+    reverse_food_map: dict = None,
+    recipes_indexed=None,
 ) -> List[CandidateItem]:
     """Convert raw two-tower model outputs into CandidateItem objects for the SA-GA."""
-    reverse_food_map = {v: k for k, v in food_id_map.items()}
+    if reverse_food_map is None:
+        reverse_food_map = {v: k for k, v in food_id_map.items()}
 
-    if 'FoodId' in recipes_df.columns:
-        recipes_indexed = (
-            recipes_df
-            .drop_duplicates(subset='FoodId', keep='first')
-            .set_index('FoodId')
-        )
-    else:
-        recipes_indexed = recipes_df
+    if recipes_indexed is None:
+        if 'FoodId' in recipes_df.columns:
+            recipes_indexed = (
+                recipes_df
+                .drop_duplicates(subset='FoodId', keep='first')
+                .set_index('FoodId')
+            )
+        else:
+            recipes_indexed = recipes_df
 
     candidates = []
     for iid, score in zip(item_ids, relevance_scores):

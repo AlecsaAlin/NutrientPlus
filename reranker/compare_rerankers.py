@@ -10,20 +10,25 @@ Usage:
 """
 
 import copy
+import os
 import time
 import sys
 import json
 import torch
 import torch.nn as nn
 import numpy as np
+import pandas as pd
+import multiprocessing as mp
 from pathlib import Path
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from tqdm.contrib.concurrent import process_map
 
-SCRIPT_DIR       = Path(__file__).parent.absolute()
-NUTRIENT_ROOT    = SCRIPT_DIR.parent
-MODEL_DIR        = NUTRIENT_ROOT / 'model'
-PREPROCESSED_DIR = NUTRIENT_ROOT / 'data' / 'preprocessed' / 'test'
+SCRIPT_DIR            = Path(__file__).parent.absolute()
+NUTRIENT_ROOT         = SCRIPT_DIR.parent
+MODEL_DIR             = NUTRIENT_ROOT / 'model'
+PREPROCESSED_DIR      = NUTRIENT_ROOT / 'data' / 'preprocessed' / 'train'
+PREPROCESSED_DIR_TEST = NUTRIENT_ROOT / 'data' / 'preprocessed' / 'test'
 MODEL_PATH       = MODEL_DIR / 'checkpoints' / 'best_model.pt'
 OUTPUT_DIR       = SCRIPT_DIR / 'results'
 
@@ -40,14 +45,6 @@ from ahp import AHPWeightComputer
 from model import TwoTowerModel
 from preprocessor import FoodDataPreprocessor, FoodRecommendationDataset
 
-
-
-def ndcg_at_k(ranked_relevances: list, k: int = 10) -> float:
-    ranked = ranked_relevances[:k]
-    dcg    = sum(rel / np.log2(r + 2) for r, rel in enumerate(ranked))
-    ideal  = sorted(ranked_relevances, reverse=True)[:k]
-    idcg   = sum(rel / np.log2(r + 2) for r, rel in enumerate(ideal))
-    return dcg / idcg if idcg > 0 else 0.0
 
 
 def nutritional_diversity(items, calorie_bands, protein_bands) -> float:
@@ -71,10 +68,8 @@ def novelty_score(items) -> float:
     return sum(1 for i in items if not i.in_user_history) / len(items) if items else 0.0
 
 
-def collect_metrics(lst, cand_label, cal_bands, prot_bands, evaluator) -> dict:
-    rel = [cand_label.get(item.item_id, 0.0) for item in lst]
+def collect_metrics(lst, cal_bands, prot_bands, evaluator) -> dict:
     return {
-        "ndcg":      ndcg_at_k(rel, k=10),
         "nutrition": nutritional_diversity(lst, cal_bands, prot_bands),
         "category":  category_diversity(lst),
         "novelty":   novelty_score(lst),
@@ -82,14 +77,37 @@ def collect_metrics(lst, cand_label, cal_bands, prot_bands, evaluator) -> dict:
     }
 
 
-def mean_store(store) -> dict:
-    return {k: float(np.mean(v)) if v else 0.0 for k, v in store.items()}
+def _eval_user(args):
+    """Worker: runs both GAs on one user's candidates. Must be module-level for Windows multiprocessing."""
+    cands, pso_config, sga_config, cal_bands, prot_bands = args
+
+    pso_reranker = GeneticReranker(pso_config, seed=42)
+    pso_eval     = FitnessEvaluator(pso_config)
+    baseline     = copy.deepcopy(cands[:10])
+    pso_list     = pso_reranker.evolve(copy.deepcopy(cands))
+    base_m = collect_metrics(baseline, cal_bands, prot_bands, pso_eval)
+    pso_m  = collect_metrics(pso_list,  cal_bands, prot_bands, pso_eval)
+
+    sga_reranker = SimpleGeneticReranker(sga_config, seed=42)
+    sga_eval     = SimpleFitnessEvaluator(sga_config)
+    sga_list     = sga_reranker.evolve(copy.deepcopy(cands))
+    sga_m = collect_metrics(sga_list, cal_bands, prot_bands, sga_eval)
+
+    return base_m, pso_m, sga_m
+
+
+def aggregate_store(store) -> dict:
+    return {
+        k: {
+            "mean": float(np.mean(v)) if v else 0.0,
+            "max":  float(np.max(v))  if v else 0.0,
+        }
+        for k, v in store.items()
+    }
 
 
 
 def main():
-    NUM_USERS = 500       
-
     GOAL_TYPE   = 'maintain_weight'
     EXPLORATION = 'balanced'
 
@@ -104,9 +122,13 @@ def main():
     info         = preprocessor.get_dataset_info()
     print(f"  Users  : {info['num_users']:,}   Items : {info['num_foods']:,}")
 
-    test_dataset = FoodRecommendationDataset(preprocessor, df=preprocessor.test_df)
+    test_df_extra = pd.read_pickle(str(PREPROCESSED_DIR_TEST / 'training_df.pkl'))
+    full_df       = pd.concat([preprocessor.training_df, test_df_extra], ignore_index=True).drop_duplicates()
+    print(f"  Train samples : {len(preprocessor.training_df):,}   Test samples : {len(test_df_extra):,}")
+
+    test_dataset = FoodRecommendationDataset(preprocessor, df=full_df)
     test_loader  = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=0)
-    print(f"  Test samples : {len(test_dataset):,}")
+    print(f"  Total samples : {len(test_dataset):,}")
 
     model = TwoTowerModel(
         num_users        = info["num_users"],
@@ -139,17 +161,14 @@ def main():
                 item_features.to(device), positions.to(device),
             )
             rank_scores = torch.sigmoid(preds["ranking"]).cpu().numpy()
-            high_labels = labels[:, 0].cpu().numpy()
 
-            for uid, iid, score, label in zip(uid_np, iid_np, rank_scores, high_labels):
+            for uid, iid, score in zip(uid_np, iid_np, rank_scores):
                 user_item_scores.setdefault(int(uid), []).append(
-                    (int(iid), float(score), float(label))
+                    (int(iid), float(score))
                 )
 
-    eligible_users = [uid for uid, items in user_item_scores.items() if len(items) >= 10]
-    sample_users   = eligible_users[:NUM_USERS]
-    print(f"  Eligible users  : {len(eligible_users):,}")
-    print(f"  Users to eval   : {len(sample_users)}")
+    sample_users = [uid for uid, items in user_item_scores.items() if len(items) >= 10]
+    print(f"  Users to eval   : {len(sample_users):,}")
 
     recipes_df               = preprocessor.recipes_df
     food_id_map              = preprocessor.food_id_map
@@ -158,9 +177,15 @@ def main():
     user_history_dict        = preprocessor.user_history_dict
     reverse_user_map         = getattr(preprocessor, 'reverse_user_map', {})
 
+    reverse_food_map = {v: k for k, v in food_id_map.items()}
+    recipes_indexed  = (
+        recipes_df.drop_duplicates(subset='FoodId', keep='first').set_index('FoodId')
+        if 'FoodId' in recipes_df.columns else recipes_df
+    )
+    print(f"  Pre-computed food lookup index ({len(recipes_indexed):,} items)")
+
     all_candidates = {}
-    all_cand_labels = {}
-    for uid in sample_users:
+    for uid in tqdm(sample_users, desc="Building candidates"):
         items  = user_item_scores[uid]
         top50  = sorted(items, key=lambda x: x[1], reverse=True)[:50]
         original_uid  = reverse_user_map.get(uid, uid)
@@ -174,10 +199,11 @@ def main():
             food_id_map              = food_id_map,
             available_nutrition_cols = available_nutrition_cols,
             max_values               = max_values,
+            reverse_food_map         = reverse_food_map,
+            recipes_indexed          = recipes_indexed,
         )
         if len(cands) >= 10:
-            all_candidates[uid]   = cands
-            all_cand_labels[uid]  = {x[0]: x[2] for x in top50}
+            all_candidates[uid] = cands
 
     eval_users = list(all_candidates.keys())
     print(f"  Users with ≥10 candidates : {len(eval_users)}")
@@ -195,75 +221,60 @@ def main():
     cal_bands    = pso_config.calorie_bands
     prot_bands   = pso_config.protein_bands
 
-    pso_store  = {"ndcg": [], "nutrition": [], "category": [], "novelty": [], "fitness": []}
-    base_store = {"ndcg": [], "nutrition": [], "category": [], "novelty": [], "fitness": []}
+    sga_config = SimpleGAConfig()
+
+    pso_store  = {"nutrition": [], "category": [], "novelty": [], "fitness": []}
+    base_store = {"nutrition": [], "category": [], "novelty": [], "fitness": []}
+    sga_store  = {"nutrition": [], "category": [], "novelty": [], "fitness": []}
+
+    args_list  = [
+        (all_candidates[uid], pso_config, sga_config, cal_bands, prot_bands)
+        for uid in eval_users
+    ]
+
+    num_workers = max(1, os.cpu_count() - 1)
+    print(f"\n── Parallel Re-ranking ({num_workers} workers) ──")
 
     t0 = time.perf_counter()
-    for uid in tqdm(eval_users, desc="PSO+AHP"):
-        cands      = all_candidates[uid]
-        cand_label = all_cand_labels[uid]
+    results = process_map(_eval_user, args_list, max_workers=num_workers, chunksize=8, desc="PSO+AHP & Simple GA")
+    for base_m, pso_m, sga_m in results:
+        for k in base_store: base_store[k].append(base_m[k])
+        for k in pso_store:  pso_store[k].append(pso_m[k])
+        for k in sga_store:  sga_store[k].append(sga_m[k])
 
-        baseline_list = copy.deepcopy(cands[:10])
-        ga_list       = pso_reranker.evolve(copy.deepcopy(cands))
+    total_time = time.perf_counter() - t0
+    pso_time   = total_time
+    sga_time   = total_time
 
-        for lst, store, ev in [
-            (baseline_list, base_store, pso_eval),
-            (ga_list,       pso_store,  pso_eval),
-        ]:
-            m = collect_metrics(lst, cand_label, cal_bands, prot_bands, ev)
-            for k in store:
-                store[k].append(m[k])
-
-    pso_time  = time.perf_counter() - t0
-    pso_agg   = mean_store(pso_store)
-    base_agg  = mean_store(base_store)
-
-    print("\n── Simple GA Re-ranking ──")
-    sga_config   = SimpleGAConfig()       
-    sga_reranker = SimpleGeneticReranker(sga_config, seed=42)
-    sga_eval     = SimpleFitnessEvaluator(sga_config)
-
-    sga_store = {"ndcg": [], "nutrition": [], "category": [], "novelty": [], "fitness": []}
-
-    t0 = time.perf_counter()
-    for uid in tqdm(eval_users, desc="Simple GA"):
-        cands      = all_candidates[uid]
-        cand_label = all_cand_labels[uid]
-
-        ga_list = sga_reranker.evolve(copy.deepcopy(cands))
-        m = collect_metrics(ga_list, cand_label, cal_bands, prot_bands, sga_eval)
-        for k in sga_store:
-            sga_store[k].append(m[k])
-
-    sga_time = time.perf_counter() - t0
-    sga_agg  = mean_store(sga_store)
+    pso_agg  = aggregate_store(pso_store)
+    base_agg = aggregate_store(base_store)
+    sga_agg  = aggregate_store(sga_store)
 
     METRIC_LABELS = {
-        "ndcg":      "NDCG@10",
         "nutrition": "Nutritional Diversity",
         "category":  "Category Diversity",
         "novelty":   "Novelty Score",
         "fitness":   "Composite Fitness",
     }
 
-    print("\n" + "=" * 78)
-    print("RESULTS  (averaged over {:,} users)".format(len(eval_users)))
-    print("=" * 78)
-    print(f"  {'Metric':<28} {'Greedy':>9} {'Simple GA':>11} {'PSO+AHP':>11} {'Δ PSO-SGA':>11}")
-    print("  " + "-" * 72)
-    for key, label in METRIC_LABELS.items():
-        b   = base_agg[key]
-        s   = sga_agg[key]
-        p   = pso_agg[key]
-        d   = p - s
-        sign = "+" if d >= 0 else ""
-        print(f"  {label:<28} {b:>9.4f} {s:>11.4f} {p:>11.4f}  {sign}{d:>9.4f}")
+    print("\n" + "=" * 90)
+    print("RESULTS  ({:,} users)".format(len(eval_users)))
+    print("=" * 90)
+    for stat in ("mean", "max"):
+        label_stat = "Average" if stat == "mean" else "Best (Max)"
+        print(f"\n  [{label_stat}]")
+        print(f"  {'Metric':<28} {'Greedy':>9} {'Simple GA':>11} {'PSO+AHP':>11} {'Δ PSO-SGA':>11}")
+        print("  " + "-" * 72)
+        for key, label in METRIC_LABELS.items():
+            b    = base_agg[key][stat]
+            s    = sga_agg[key][stat]
+            p    = pso_agg[key][stat]
+            d    = p - s
+            sign = "+" if d >= 0 else ""
+            print(f"  {label:<28} {b:>9.4f} {s:>11.4f} {p:>11.4f}  {sign}{d:>9.4f}")
 
     print()
-    print(f"  Time — PSO+AHP : {pso_time:.1f}s   ({pso_time/len(eval_users)*1000:.0f} ms/user)")
-    print(f"  Time — Simple GA : {sga_time:.1f}s   ({sga_time/len(eval_users)*1000:.0f} ms/user)")
-    speedup = pso_time / sga_time if sga_time > 0 else float('inf')
-    print(f"  PSO+AHP is {speedup:.2f}× {'slower' if speedup > 1 else 'faster'} than Simple GA")
+    print(f"  Total wall time : {total_time:.1f}s   ({total_time/len(eval_users)*1000:.0f} ms/user, {num_workers} workers)")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = OUTPUT_DIR / "comparison_pso_ahp_vs_simple_ga.json"
@@ -277,12 +288,14 @@ def main():
         "greedy_baseline": base_agg,
         "simple_ga": sga_agg,
         "pso_ahp":   pso_agg,
-        "delta_pso_minus_sga": {k: round(pso_agg[k] - sga_agg[k], 6) for k in pso_agg},
+        "delta_pso_minus_sga": {
+            k: {s: round(pso_agg[k][s] - sga_agg[k][s], 6) for s in ("mean", "max")}
+            for k in pso_agg
+        },
         "timing": {
-            "pso_ahp_total_s":   round(pso_time,  2),
-            "simple_ga_total_s": round(sga_time, 2),
-            "pso_ahp_ms_per_user":   round(pso_time  / len(eval_users) * 1000, 1),
-            "simple_ga_ms_per_user": round(sga_time / len(eval_users) * 1000, 1),
+            "total_wall_s":    round(total_time, 2),
+            "ms_per_user":     round(total_time / len(eval_users) * 1000, 1),
+            "num_workers":     num_workers,
         },
     }
     with open(out_path, "w") as f:

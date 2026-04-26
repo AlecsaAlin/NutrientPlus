@@ -53,8 +53,12 @@ class BWOConfig:
 
     def __post_init__(self):
         total = self.w_relevance + self.w_nutrition + self.w_category + self.w_novelty
-        if abs(total - 1.0) > 1e-6:
+        if abs(total - 1.0) > 1e-2:
             raise ValueError(f"Fitness weights must sum to 1.0, got {total:.6f}")
+        self.w_relevance /= total
+        self.w_nutrition /= total
+        self.w_category  /= total
+        self.w_novelty   /= total
 
 
 
@@ -206,9 +210,10 @@ class BWOReranker:
             new_population.append(population[i])
             new_fitness.append(fitness[i])
 
-        # Mutation — PM fraction of population randomly mutated
-        n_mutate = max(1, int(self.cfg.mutation_rate * len(new_population)))
-        mutate_indices = random.sample(range(len(new_population)), min(n_mutate, len(new_population)))
+        diversity         = float(np.std(fitness)) if fitness else 0.0
+        effective_rate    = self.cfg.mutation_rate * (2.0 if diversity < 0.005 else 1.0)
+        n_mutate          = max(1, int(effective_rate * len(new_population)))
+        mutate_indices    = random.sample(range(len(new_population)), min(n_mutate, len(new_population)))
         for idx in mutate_indices:
             mutated     = self._mutate(new_population[idx], candidates)
             mutated_fit = self.evaluator.evaluate(mutated)

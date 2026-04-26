@@ -7,8 +7,14 @@ side-by-side table of list-level metrics + timing.
 Usage:
     cd NutrientPlus/reranker
     python compare_rerankers.py
+    python compare_rerankers.py --goal eat_healthier --exploration adventurous
+    python compare_rerankers.py --goal lose_weight --exploration conservative
+
+Goals       : lose_weight | gain_muscle | maintain_weight | eat_healthier
+Exploration : conservative | balanced | adventurous
 """
 
+import argparse
 import copy
 import os
 import time
@@ -43,6 +49,7 @@ from ga_reranker import (
 from simple_ga_reranker import SimpleGAConfig, SimpleGeneticReranker, SimpleFitnessEvaluator
 from nsga3_reranker import NSGA3Config, NSGA3Reranker, ObjectiveEvaluator
 from bwo_reranker import BWOConfig, BWOReranker, BWOFitnessEvaluator
+from mopso_reranker import MOPSOConfig, MOPSOReranker
 from ahp import AHPWeightComputer
 from model import TwoTowerModel
 from preprocessor import FoodDataPreprocessor, FoodRecommendationDataset
@@ -80,38 +87,41 @@ def collect_metrics(lst, cal_bands, prot_bands, evaluator) -> dict:
 
 
 def _eval_user(args):
-    """Worker: runs all GAs on one user's candidates. Must be module-level for Windows multiprocessing.
+    """Worker: runs all rerankers on one user's candidates.
 
     All output metrics — including Composite Fitness — are measured with the
     same shared AHP-weighted FitnessEvaluator so results are directly
     comparable across algorithms.  Each reranker still uses its own internal
     evaluator during evolution; only the final measurement is unified.
     """
-    cands, pso_config, sga_config, nsga3_config, bwo_config, cal_bands, prot_bands = args
+    cands, pso_config, sga_config, nsga3_config, bwo_config, mopso_config, cal_bands, prot_bands = args
 
-    # Shared evaluator 
     shared_eval = FitnessEvaluator(pso_config)
 
-    baseline     = copy.deepcopy(cands[:10])
-    base_m = collect_metrics(baseline, cal_bands, prot_bands, shared_eval)
+    baseline = copy.deepcopy(cands[:10])
+    base_m   = collect_metrics(baseline, cal_bands, prot_bands, shared_eval)
 
     pso_reranker = GeneticReranker(pso_config, seed=42)
     pso_list     = pso_reranker.evolve(copy.deepcopy(cands))
-    pso_m  = collect_metrics(pso_list, cal_bands, prot_bands, shared_eval)
+    pso_m        = collect_metrics(pso_list, cal_bands, prot_bands, shared_eval)
 
     sga_reranker = SimpleGeneticReranker(sga_config, seed=42)
     sga_list     = sga_reranker.evolve(copy.deepcopy(cands))
-    sga_m = collect_metrics(sga_list, cal_bands, prot_bands, shared_eval)
+    sga_m        = collect_metrics(sga_list, cal_bands, prot_bands, shared_eval)
 
     nsga3_reranker = NSGA3Reranker(nsga3_config, seed=42)
     nsga3_list     = nsga3_reranker.evolve(copy.deepcopy(cands))
-    nsga3_m = collect_metrics(nsga3_list, cal_bands, prot_bands, shared_eval)
+    nsga3_m        = collect_metrics(nsga3_list, cal_bands, prot_bands, shared_eval)
 
     bwo_reranker = BWOReranker(bwo_config, seed=42)
     bwo_list     = bwo_reranker.evolve(copy.deepcopy(cands))
-    bwo_m = collect_metrics(bwo_list, cal_bands, prot_bands, shared_eval)
+    bwo_m        = collect_metrics(bwo_list, cal_bands, prot_bands, shared_eval)
 
-    return base_m, pso_m, sga_m, nsga3_m, bwo_m
+    mopso_reranker = MOPSOReranker(mopso_config, seed=42)
+    mopso_list     = mopso_reranker.evolve(copy.deepcopy(cands))
+    mopso_m        = collect_metrics(mopso_list, cal_bands, prot_bands, shared_eval)
+
+    return base_m, pso_m, sga_m, nsga3_m, bwo_m, mopso_m
 
 
 def aggregate_store(store) -> dict:
@@ -125,13 +135,41 @@ def aggregate_store(store) -> dict:
 
 
 
+VALID_GOALS  = ['lose_weight', 'gain_muscle', 'maintain_weight', 'eat_healthier']
+VALID_PREFS  = ['conservative', 'balanced', 'adventurous']
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='NutrientPlus — GA Reranker Comparison',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            'Examples:\n'
+            '  python compare_rerankers.py\n'
+            '  python compare_rerankers.py --goal eat_healthier --exploration adventurous\n'
+            '  python compare_rerankers.py --goal lose_weight --exploration conservative\n'
+        ),
+    )
+    parser.add_argument(
+        '--goal', default='maintain_weight', choices=VALID_GOALS,
+        help='User dietary goal (default: maintain_weight)',
+    )
+    parser.add_argument(
+        '--exploration', default='balanced', choices=VALID_PREFS,
+        help='User exploration preference (default: balanced)',
+    )
+    return parser.parse_args()
+
+
 def main():
-    GOAL_TYPE   = 'maintain_weight'
-    EXPLORATION = 'balanced'
+    args        = parse_args()
+    GOAL_TYPE   = args.goal
+    EXPLORATION = args.exploration
 
     print("\n" + "=" * 70)
     print("NUTRIENTPLUS  —  GA Reranker Comparison  (Head-to-Head)")
     print("=" * 70)
+    print(f"\n  Profile : {GOAL_TYPE} / {EXPLORATION}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n✓ Device : {device}")
@@ -202,16 +240,35 @@ def main():
     )
     print(f"  Pre-computed food lookup index ({len(recipes_indexed):,} items)")
 
+
+    TOP_BY_RELEVANCE = 50
+    TOP_UNSEEN_BOOST = 20
+
     all_candidates = {}
     for uid in tqdm(sample_users, desc="Building candidates"):
-        items  = user_item_scores[uid]
-        top50  = sorted(items, key=lambda x: x[1], reverse=True)[:50]
+        items         = user_item_scores[uid]
         original_uid  = reverse_user_map.get(uid, uid)
         user_hist_ids = set(user_history_dict.get(original_uid, []))
+        
+        hist_mapped = {
+            food_id_map[h] for h in user_hist_ids if h in food_id_map
+        }
+
+        sorted_items = sorted(items, key=lambda x: x[1], reverse=True)
+        top_rel      = sorted_items[:TOP_BY_RELEVANCE]
+
+        in_pool       = {iid for iid, _ in top_rel}
+        unseen_items  = [
+            (iid, s) for (iid, s) in sorted_items
+            if iid not in hist_mapped and iid not in in_pool
+        ]
+        top_unseen    = unseen_items[:TOP_UNSEEN_BOOST]
+
+        pool          = top_rel + top_unseen      # up to 70 items
 
         cands = build_candidates_from_model_output(
-            item_ids                 = [x[0] for x in top50],
-            relevance_scores         = [x[1] for x in top50],
+            item_ids                 = [x[0] for x in pool],
+            relevance_scores         = [x[1] for x in pool],
             recipes_df               = recipes_df,
             user_history_ids         = user_hist_ids,
             food_id_map              = food_id_map,
@@ -233,24 +290,47 @@ def main():
     for k, v in weights.items():
         print(f"    {k}: {v:.4f}")
 
-    pso_config   = GAConfig(**weights)
+    SHARED_GENERATIONS  = 20
+    SHARED_POPULATION   = 60
+
+    pso_config   = GAConfig(
+        **weights,
+        num_generations = SHARED_GENERATIONS,
+        population_size = SHARED_POPULATION,
+    )
     pso_reranker = GeneticReranker(pso_config, seed=42)
     pso_eval     = FitnessEvaluator(pso_config)
     cal_bands    = pso_config.calorie_bands
     prot_bands   = pso_config.protein_bands
 
-    sga_config   = SimpleGAConfig()
+    sga_config   = SimpleGAConfig(
+        num_generations = SHARED_GENERATIONS,
+        population_size = SHARED_POPULATION,
+    )
     nsga3_config = NSGA3Config(
-        w_relevance = weights["w_relevance"],
-        w_nutrition = weights["w_nutrition"],
-        w_category  = weights["w_category"],
-        w_novelty   = weights["w_novelty"],
+        w_relevance     = weights["w_relevance"],
+        w_nutrition     = weights["w_nutrition"],
+        w_category      = weights["w_category"],
+        w_novelty       = weights["w_novelty"],
+        num_generations = SHARED_GENERATIONS,
+        population_size = SHARED_POPULATION,
+        num_divisions   = 4,   # → 35 ref dirs, must be ≤ population_size
     )
     bwo_config = BWOConfig(
-        w_relevance = weights["w_relevance"],
-        w_nutrition = weights["w_nutrition"],
-        w_category  = weights["w_category"],
-        w_novelty   = weights["w_novelty"],
+        w_relevance     = weights["w_relevance"],
+        w_nutrition     = weights["w_nutrition"],
+        w_category      = weights["w_category"],
+        w_novelty       = weights["w_novelty"],
+        num_generations = SHARED_GENERATIONS,
+        population_size = SHARED_POPULATION,
+    )
+    mopso_config = MOPSOConfig(
+        w_relevance     = weights["w_relevance"],
+        w_nutrition     = weights["w_nutrition"],
+        w_category      = weights["w_category"],
+        w_novelty       = weights["w_novelty"],
+        num_generations = SHARED_GENERATIONS,
+        population_size = SHARED_POPULATION,
     )
 
     pso_store   = {"nutrition": [], "category": [], "novelty": [], "fitness": []}
@@ -258,33 +338,35 @@ def main():
     sga_store   = {"nutrition": [], "category": [], "novelty": [], "fitness": []}
     nsga3_store = {"nutrition": [], "category": [], "novelty": [], "fitness": []}
     bwo_store   = {"nutrition": [], "category": [], "novelty": [], "fitness": []}
+    mopso_store = {"nutrition": [], "category": [], "novelty": [], "fitness": []}
 
-    args_list  = [
-        (all_candidates[uid], pso_config, sga_config, nsga3_config, bwo_config, cal_bands, prot_bands)
+    args_list = [
+        (all_candidates[uid], pso_config, sga_config, nsga3_config,
+         bwo_config, mopso_config, cal_bands, prot_bands)
         for uid in eval_users
     ]
 
-    num_workers = max(1, os.cpu_count() - 1)
+    num_workers = max(1, os.cpu_count() - 2)
     print(f"\n── Parallel Re-ranking ({num_workers} workers) ──")
 
     t0 = time.perf_counter()
     results = process_map(_eval_user, args_list, max_workers=num_workers, chunksize=8, desc="All rerankers")
-    for base_m, pso_m, sga_m, nsga3_m, bwo_m in results:
-        for k in base_store:  base_store[k].append(base_m[k])
-        for k in pso_store:   pso_store[k].append(pso_m[k])
-        for k in sga_store:   sga_store[k].append(sga_m[k])
-        for k in nsga3_store: nsga3_store[k].append(nsga3_m[k])
-        for k in bwo_store:   bwo_store[k].append(bwo_m[k])
+    for base_m, pso_m, sga_m, nsga3_m, bwo_m, mopso_m in results:
+        for k in base_store:   base_store[k].append(base_m[k])
+        for k in pso_store:    pso_store[k].append(pso_m[k])
+        for k in sga_store:    sga_store[k].append(sga_m[k])
+        for k in nsga3_store:  nsga3_store[k].append(nsga3_m[k])
+        for k in bwo_store:    bwo_store[k].append(bwo_m[k])
+        for k in mopso_store:  mopso_store[k].append(mopso_m[k])
 
     total_time = time.perf_counter() - t0
-    pso_time   = total_time
-    sga_time   = total_time
 
     pso_agg   = aggregate_store(pso_store)
     base_agg  = aggregate_store(base_store)
     sga_agg   = aggregate_store(sga_store)
     nsga3_agg = aggregate_store(nsga3_store)
     bwo_agg   = aggregate_store(bwo_store)
+    mopso_agg = aggregate_store(mopso_store)
 
     METRIC_LABELS = {
         "nutrition": "Nutritional Diversity",
@@ -293,35 +375,39 @@ def main():
         "fitness":   "Composite Fitness",
     }
 
-    print("\n" + "=" * 114)
+    print("\n" + "=" * 127)
     print("RESULTS  ({:,} users)".format(len(eval_users)))
-    print("=" * 114)
+    print("=" * 127)
     for stat in ("mean", "max"):
         label_stat = "Average" if stat == "mean" else "Best (Max)"
         print(f"\n  [{label_stat}]")
-        print(f"  {'Metric':<28} {'Greedy':>9} {'Simple GA':>11} {'PSO+AHP':>11} {'NSGA-III':>11} {'BWO':>11} {'Δ BWO-PSO':>12}")
-        print("  " + "-" * 96)
+        print(f"  {'Metric':<28} {'Greedy':>9} {'Simple GA':>11} {'PSO+AHP':>11} {'NSGA-III':>11} {'BWO':>11} {'MOPSO':>11} {'Δ MOPSO-PSO':>13}")
+        print("  " + "-" * 108)
         for key, label in METRIC_LABELS.items():
             b    = base_agg[key][stat]
             s    = sga_agg[key][stat]
             p    = pso_agg[key][stat]
             n    = nsga3_agg[key][stat]
             bw   = bwo_agg[key][stat]
-            d    = bw - p
+            mo   = mopso_agg[key][stat]
+            d    = mo - p
             sign = "+" if d >= 0 else ""
-            print(f"  {label:<28} {b:>9.4f} {s:>11.4f} {p:>11.4f} {n:>11.4f} {bw:>11.4f}  {sign}{d:>9.4f}")
+            print(f"  {label:<28} {b:>9.4f} {s:>11.4f} {p:>11.4f} {n:>11.4f} {bw:>11.4f} {mo:>11.4f}  {sign}{d:>9.4f}")
 
     print()
     print(f"  Total wall time : {total_time:.1f}s   ({total_time/len(eval_users)*1000:.0f} ms/user, {num_workers} workers)")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT_DIR / "comparison_all_rerankers.json"
+    out_path = OUTPUT_DIR / f"comparison_{GOAL_TYPE}_{EXPLORATION}.json"
     result = {
         "settings": {
             "goal_type": GOAL_TYPE,
             "exploration_preference": EXPLORATION,
             "users_evaluated": len(eval_users),
             "ahp_weights": weights,
+            "shared_generations": SHARED_GENERATIONS,
+            "shared_population": SHARED_POPULATION,
+            "candidate_pool": f"top-{TOP_BY_RELEVANCE} relevance + top-{TOP_UNSEEN_BOOST} unseen boost",
             "fitness_evaluator": "FitnessEvaluator (AHP-weighted) — shared across all algorithms for fair comparison",
         },
         "greedy_baseline": base_agg,
@@ -329,6 +415,7 @@ def main():
         "pso_ahp":         pso_agg,
         "nsga3":           nsga3_agg,
         "bwo":             bwo_agg,
+        "mopso":           mopso_agg,
         "delta_pso_minus_sga": {
             k: {s: round(pso_agg[k][s] - sga_agg[k][s], 6) for s in ("mean", "max")}
             for k in pso_agg
@@ -340,6 +427,10 @@ def main():
         "delta_bwo_minus_pso": {
             k: {s: round(bwo_agg[k][s] - pso_agg[k][s], 6) for s in ("mean", "max")}
             for k in bwo_agg
+        },
+        "delta_mopso_minus_pso": {
+            k: {s: round(mopso_agg[k][s] - pso_agg[k][s], 6) for s in ("mean", "max")}
+            for k in mopso_agg
         },
         "timing": {
             "total_wall_s":    round(total_time, 2),

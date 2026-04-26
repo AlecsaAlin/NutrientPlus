@@ -73,8 +73,12 @@ class GAConfig:
 
     def __post_init__(self):
         total = self.w_relevance + self.w_nutrition + self.w_category + self.w_novelty
-        if abs(total - 1.0) > 1e-6:
-            raise ValueError(f"Fitness weights must sum to 1.0, got {total}")
+        if abs(total - 1.0) > 1e-2:
+            raise ValueError(f"Fitness weights must sum to 1.0, got {total:.6f}")
+        self.w_relevance /= total
+        self.w_nutrition /= total
+        self.w_category  /= total
+        self.w_novelty   /= total
         if not (0.0 < self.sa_cooling_rate < 1.0):
             raise ValueError("sa_cooling_rate must be strictly between 0 and 1.")
 
@@ -195,6 +199,9 @@ class GeneticReranker:
                 best_chromosome = copy.deepcopy(population[0])
                 gbest           = copy.deepcopy(population[0])
 
+            diversity         = float(np.std(fitness_scores))
+            effective_mutation = self.cfg.mutation_rate * (2.0 if diversity < 0.005 else 1.0)
+
             next_gen           = list(population[:elite_n])
             next_gen_fitness   = list(fitness_scores[:elite_n])
             next_pbest         = list(pbest[:elite_n])
@@ -212,7 +219,7 @@ class GeneticReranker:
                 child_fitness = self.evaluator.evaluate(child)
 
                 idx_in_pop = len(next_gen)
-                if random.random() < self.cfg.mutation_rate:
+                if random.random() < effective_mutation:
                     pb_ref = (pbest[idx_in_pop]
                               if idx_in_pop < len(pbest) else None)
                     mutated = self._pso_mutate(

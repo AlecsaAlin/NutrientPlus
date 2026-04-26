@@ -44,8 +44,12 @@ class SimpleGAConfig:
 
     def __post_init__(self):
         total = self.w_relevance + self.w_nutrition + self.w_category + self.w_novelty
-        if abs(total - 1.0) > 1e-6:
+        if abs(total - 1.0) > 1e-2:
             raise ValueError(f"Fitness weights must sum to 1.0, got {total:.6f}")
+        self.w_relevance /= total
+        self.w_nutrition /= total
+        self.w_category  /= total
+        self.w_novelty   /= total
 
 
 @dataclass
@@ -145,6 +149,9 @@ class SimpleGeneticReranker:
                 best_fit   = fitness[0]
                 best_chrom = copy.deepcopy(population[0])
 
+            diversity        = float(np.std(fitness))
+            effective_mutation = self.cfg.mutation_rate * (2.0 if diversity < 0.005 else 1.0)
+
             next_gen     = list(population[:elite_n])
             next_fitness = list(fitness[:elite_n])
 
@@ -159,10 +166,10 @@ class SimpleGeneticReranker:
 
                 child_fit = self.evaluator.evaluate(child)
 
-                if random.random() < self.cfg.mutation_rate:
+                if random.random() < effective_mutation:
                     mutated     = self._mutate(child, candidates)
                     mutated_fit = self.evaluator.evaluate(mutated)
-                    if mutated_fit > child_fit:          
+                    if mutated_fit > child_fit:
                         child     = mutated
                         child_fit = mutated_fit
 
